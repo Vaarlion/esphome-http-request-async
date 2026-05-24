@@ -1,0 +1,192 @@
+# ESPHome compilation test — Tier 3.
+#
+# Run:  make compile
+#       (or: esphome compile tests/esphome/test_config.yaml)
+#
+# This config exercises all actions, both JSON forms, and all trigger
+# combinations. If it compiles without errors, the Python codegen and C++
+# typing are correct.
+#
+# Does not flash anything.
+
+esphome:
+  name: http-async-test
+  friendly_name: HTTP Async Test
+  on_boot:
+    priority: -100
+    then:
+      - logger.log: "http_request_async test config boot OK"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: test_ssid
+  password: test_password
+
+logger:
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+    components: [http_request_async]
+
+http_request_async:
+  id: http_client
+  timeout: 5s
+  verify_ssl: false
+  follow_redirects: true
+  redirect_limit: 3
+  buffer_size_rx: 1024
+  buffer_size_tx: 512
+  task_stack_size: 8192
+  task_priority: 5
+
+# Globals to make the lambda tests compile
+globals:
+  - id: test_output
+    type: std::string
+    initial_value: '""'
+  - id: test_brightness
+    type: std::string
+    initial_value: '""'
+
+# ── Test: GET with capture_response and json::parse_json ─────────────────────
+script:
+  - id: test_get_with_parse
+    mode: queued
+    parameters:
+      ip: string
+      light_id: int
+      status_index: int
+    then:
+      - http_request_async.get:
+          url: !lambda 'return str_sprintf("http://%s/rpc/Light.GetStatus?id=%d", ip.c_str(), light_id);'
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [status_index](JsonObject root) -> bool {
+                    if (root["output"].is<std::string>()) {
+                      id(test_output) = root["output"].as<std::string>();
+                      return true;
+                    }
+                    return false;
+                  });
+          on_error:
+            then:
+              - logger.log: "GET failed"
+
+  # ── Test: POST with JSON lambda (nested objects, non-string values) ─────────
+  - id: test_post_json_lambda
+    mode: queued
+    parameters:
+      ip: string
+      light_id: int
+    then:
+      - http_request_async.post:
+          url: !lambda 'return str_sprintf("http://%s/rpc", ip.c_str());'
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["jsonrpc"] = "2.0";
+            root["id"] = "1";
+            root["src"] = "kc868_hardware";
+            root["method"] = "Light.Set";
+            root["params"]["id"] = to_string(light_id);
+            root["params"]["on"] = true;
+            root["params"]["brightness"] = "100";
+          on_response:
+            then:
+              - logger.log:
+                  format: "status=%d duration=%ums ct=%s body=%s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - response->get_response_header("Content-Type").c_str()
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "POST failed"
+
+  # ── Test: POST with JSON dict form ──────────────────────────────────────────
+  - id: test_post_json_dict
+    mode: queued
+    parameters:
+      device_name: string
+    then:
+      - http_request_async.post:
+          url: "http://192.168.1.100/api/report"
+          capture_response: false
+          request_headers:
+            Content-Type: application/json
+          json:
+            device: !lambda 'return device_name;'
+            version: "1.0"
+          on_response:
+            then:
+              - logger.log:
+                  format: "Dict JSON POST status=%d"
+                  args: [response->status_code]
+          on_error:
+            then:
+              - logger.log: "Dict JSON POST failed"
+
+  # ── Test: send (PUT) with verbatim body ─────────────────────────────────────
+  - id: test_send_put
+    mode: queued
+    then:
+      - http_request_async.send:
+          method: PUT
+          url: "http://192.168.1.100/api/config"
+          body: '{"key":"value"}'
+          on_response:
+            then:
+              - logger.log:
+                  format: "PUT status=%d"
+                  args: [response->status_code]
+
+  # ── Test: GET without on_response (fire and forget logging) ─────────────────
+  - id: test_get_no_response_handler
+    mode: queued
+    then:
+      - http_request_async.get:
+          url: "http://192.168.1.100/ping"
+          on_error:
+            then:
+              - logger.log: "Ping failed"
+
+  # ── Test: night mode bool parameter (matches shelly_api_Light_SetNightMode) ──
+  - id: test_post_bool_param
+    mode: queued
+    parameters:
+      ip: string
+      light_id: int
+      night_mode_enable: bool
+    then:
+      - http_request_async.post:
+          url: !lambda 'return str_sprintf("http://%s/rpc", ip.c_str());'
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["jsonrpc"] = "2.0";
+            root["id"] = "2";
+            root["method"] = "Light.SetConfig";
+            root["params"]["id"] = to_string(light_id);
+            root["params"]["config"]["night_mode"]["enable"] = night_mode_enable;
+            root["params"]["config"]["night_mode"]["brightness"] = 5;
+          on_response:
+            then:
+              - logger.log:
+                  format: "SetConfig status=%d body=%s"
+                  args: [response->status_code, body.c_str()]
+          on_error:
+            then:
+              - logger.log: "SetConfig failed"

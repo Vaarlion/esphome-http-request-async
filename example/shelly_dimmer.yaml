@@ -1,0 +1,152 @@
+# Example: Shelly dimmer control via http_request_async
+#
+# Demonstrates a direct migration of the blocking http_request scripts to the
+# async version. All scripts work identically from the YAML perspective.
+# The difference: the ESP32 main loop keeps running while HTTP requests are
+# in flight — sensors update, BLE scans continue, display refreshes normally.
+
+esphome:
+  name: kc868-shelly-controller
+  friendly_name: Shelly Dimmer Controller
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: DEBUG
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/your-handle/esphome-http-request-async
+      ref: main
+    components: [http_request_async]
+
+http_request_async:
+  id: http_client
+  timeout: 4.5s
+  verify_ssl: false          # Shelly uses plain HTTP
+  follow_redirects: false    # Shelly doesn't redirect
+  buffer_size_rx: 1024       # Shelly responses are small
+  task_stack_size: 8192
+  task_priority: 5
+
+globals:
+  - id: dimmer_outputs
+    type: std::vector<std::string>
+    initial_value: 'std::vector<std::string>(4, "false")'
+  - id: dimmer_brightnesses
+    type: std::vector<std::string>
+    initial_value: 'std::vector<std::string>(4, "0")'
+  - id: dimmer_last_action
+    type: std::vector<std::string>
+    initial_value: 'std::vector<std::string>(4, "")'
+  - id: dimmer_night_mode
+    type: std::vector<std::string>
+    initial_value: 'std::vector<std::string>(4, "false")'
+
+# ── Shelly API scripts — identical to the http_request originals ──────────────
+
+script:
+  - id: shelly_api_Light_GetStatus
+    mode: queued
+    parameters:
+      ip: string
+      light_id: int
+      status_index: int
+    then:
+      - http_request_async.get:
+          url: !lambda 'return str_sprintf("http://%s/rpc/Light.GetStatus?id=%d", ip.c_str(), light_id);'
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [status_index](JsonObject root) -> bool {
+                      if (root.containsKey("output") && root.containsKey("brightness")) {
+                          id(dimmer_outputs)[status_index] = root["output"].as<std::string>();
+                          id(dimmer_brightnesses)[status_index] = root["brightness"].as<std::string>();
+                          return true;
+                      }
+                      return false;
+                  });
+          on_error:
+            then:
+              - logger.log: "Request to Shelly failed!"
+
+  - id: shelly_api_Light_SimpleClick
+    mode: queued
+    parameters:
+      ip: string
+      light_id: int
+      status_index: int
+    then:
+      - http_request_async.post:
+          url: !lambda 'return str_sprintf("http://%s/rpc", ip.c_str());'
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["jsonrpc"] = "2.0";
+            root["id"] = "1";
+            root["src"] = "kc868_hardware";
+            root["method"] = "Light.Toggle";
+            root["params"]["id"] = to_string(light_id);
+          on_response:
+            then:
+              - logger.log:
+                  format: "Response status: %d, Duration: %u ms, Body: %s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "Request to Shelly failed!"
+      - script.execute:
+          id: shelly_api_Light_GetStatus
+          ip: !lambda 'return ip;'
+          light_id: !lambda 'return light_id;'
+          status_index: !lambda 'return status_index;'
+
+  - id: shelly_api_Light_SetNightMode
+    mode: queued
+    parameters:
+      ip: string
+      light_id: int
+      status_index: int
+      night_mode_enable: bool
+    then:
+      - http_request_async.post:
+          url: !lambda 'return str_sprintf("http://%s/rpc", ip.c_str());'
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["jsonrpc"] = "2.0";
+            root["id"] = "2";
+            root["src"] = "kc868_hardware";
+            root["method"] = "Light.SetConfig";
+            root["params"]["id"] = to_string(light_id);
+            root["params"]["config"]["night_mode"]["enable"] = night_mode_enable;
+            root["params"]["config"]["night_mode"]["brightness"] = 5;
+          on_response:
+            then:
+              - logger.log:
+                  format: "Response status: %d, Duration: %u ms, Body: %s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "Request to Shelly failed!"
+      - lambda: |-
+          id(dimmer_night_mode)[status_index] = night_mode_enable ? "true" : "false";

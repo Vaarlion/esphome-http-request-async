@@ -1,0 +1,13 @@
+# Python test-time dependencies for http_request_async
+#
+# Installed by:  make init
+# Upgraded by:   make upgrade   (run after each ESPHome monthly release)
+# Used by:       make test-python, make compile
+#
+# No version pins — this project tracks the latest ESPHome release.
+# esphome releases monthly (YYYY.MM.patch); run `make upgrade` after each one
+# to pull the new version, then verify with `make test && make compile`.
+
+esphome
+pytest
+pytest-asyncio
