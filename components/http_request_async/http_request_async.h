@@ -318,7 +318,11 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
     // Returns immediately. The automation chain is resumed by on_complete_cb.
   }
 
-  bool is_running() override { return this->is_waiting_; }
+  // is_waiting_ tracks THIS action's in-flight state; is_running_next_() tracks
+  // whether any chained action (e.g., the step after the HTTP action in a script)
+  // is still executing. Both must be consulted so that mode:single scripts remain
+  // "running" throughout the entire chain, not just during the HTTP request itself.
+  bool is_running() override { return this->is_waiting_ || this->is_running_next_(); }
 
   void stop() override {
     // Mark all in-flight callbacks as dead so they become no-ops when they
@@ -329,6 +333,13 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
       *this->alive_ = false;
     }
     this->is_waiting_ = false;
+    // num_running_ is reset to 0 by the base class stop_complex() immediately
+    // after calling stop(). Resetting it here too makes stop() safe for callers
+    // (e.g. unit tests) that invoke stop() directly rather than stop_complex().
+    // play_next_tuple_() checks num_running_ > 0 before advancing the chain,
+    // so an alive-guard-suppressed on_complete_cb can no longer decrement it
+    // below zero via a double-call to play_next_().
+    this->num_running_ = 0;
   }
 
  protected:

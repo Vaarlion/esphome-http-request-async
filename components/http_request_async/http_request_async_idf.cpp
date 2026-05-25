@@ -335,21 +335,37 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
   if (req->capture_response) {
     char buf[256];
     int read_len = 0;
-    bool truncation_warned = false;
     while ((read_len = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
-      const size_t remaining_cap =
-          req->max_response_buffer_size - container->body.size();
-      if (remaining_cap > 0) {
-        const size_t to_copy =
-            std::min(static_cast<size_t>(read_len), remaining_cap);
-        container->body.append(buf, to_copy);
-        if (!truncation_warned && to_copy < static_cast<size_t>(read_len)) {
-          ESP_LOGW(TAG, "Response body truncated at %zu bytes (max_response_buffer_size)",
-                   req->max_response_buffer_size);
-          truncation_warned = true;
-        }
+      const size_t already = container->body.size();
+      if (already >= req->max_response_buffer_size) {
+        // Cap was hit exactly on the previous iteration's boundary.
+        // Log once and stop reading — no point burning the timeout draining data
+        // that will be discarded.
+        ESP_LOGW(TAG, "Response body truncated at %zu bytes (max_response_buffer_size)",
+                 req->max_response_buffer_size);
+        break;
+      }
+      const size_t to_copy = std::min(
+          static_cast<size_t>(read_len),
+          req->max_response_buffer_size - already);
+      container->body.append(buf, to_copy);
+      if (to_copy < static_cast<size_t>(read_len)) {
+        // This chunk straddled the cap boundary — last bytes we accept.
+        ESP_LOGW(TAG, "Response body truncated at %zu bytes (max_response_buffer_size)",
+                 req->max_response_buffer_size);
+        break;
       }
     }
+  }
+
+  // For chunked transfer encoding, esp_http_client_fetch_headers() returns -1
+  // (no Content-Length header), so content_length was set to 0 above. After
+  // reading the body, update it to the actual byte count so callers get a
+  // consistent value regardless of whether the server used Content-Length or
+  // chunked encoding. If capture_response was false, content_length stays 0
+  // (we have no byte count to report).
+  if (req->capture_response && container->content_length == 0 && !container->body.empty()) {
+    container->content_length = container->body.size();
   }
 
   container->duration_ms =

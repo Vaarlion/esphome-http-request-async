@@ -194,7 +194,7 @@ Supported methods: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`.
 | `response` | `std::shared_ptr<HttpContainer>` | Always available |
 | `response->status_code` | `int` | HTTP status (200, 404, …) |
 | `response->duration_ms` | `uint32_t` | Total wall-clock time for the request |
-| `response->content_length` | `size_t` | From `Content-Length`; 0 if chunked or absent |
+| `response->content_length` | `size_t` | Bytes in the body. From `Content-Length` header when present; derived from the captured body size for chunked responses; 0 if `capture_response: false`. |
 | `response->get_response_header("name")` | `std::string` | Case-insensitive; empty if not collected |
 | `body` | `std::string &` | Response body; only when `capture_response: true` |
 

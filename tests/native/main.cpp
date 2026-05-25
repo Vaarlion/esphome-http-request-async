@@ -580,7 +580,16 @@ TEST(HttpRequestAsync, NullCallbacksDoNotCrashOnNetworkDown) {
   network::g_is_connected = true;
 }
 
-// ── content_length reflects the full server payload size ─────────────────────
+// ── content_length reflects the received payload size ────────────────────────
+//
+// For Content-Length responses: set from the header value by the IDF path.
+// For chunked responses: set from body.size() after the read loop (IDF fix).
+// The mock sets content_length = body.size() in both cases, so this test covers
+// the contract that the callback always sees a non-zero content_length when the
+// body was captured — regardless of transfer encoding.
+//
+// Hardware verification: test_chunked_content_length in hardware_test.yaml
+// exercises the real IDF path with a genuine chunked response.
 
 TEST(HttpRequestAsync, ContentLengthMatchesResponseBodySize) {
   MockHttpRequestAsyncComponent comp;
@@ -630,11 +639,63 @@ TEST(HttpRequestAsync, IsRunningFollowsRequestLifecycle) {
   EXPECT_FALSE(action.is_running());   // on_complete_cb fired: is_waiting_ = false
 }
 
+// ── MockNextAction ────────────────────────────────────────────────────────────
+//
+// Simulates an async action chained after the HTTP action (e.g. a second HTTP
+// request, a delay, or a script.execute). It stays "running" until finish() is
+// called explicitly, so the test can verify that is_running() on the HTTP
+// action propagates through the chain.
+
+class MockNextAction : public esphome::Action<> {
+ public:
+  void play() override {}  // required pure-virtual stub; never called directly
+
+  // Override play_complex() to simulate an async action in progress.
+  // Intentionally does NOT call play_next_() — the action stays running until
+  // finish() is called.
+  void play_complex() override { this->num_running_++; }
+
+  // Simulate this action completing and advancing any further chain.
+  void finish() { this->play_next_(); }
+};
+
+// ── is_running() propagates through chained actions (mode:single) ─────────────
+//
+// When on_complete_cb fires it advances the chain (play_next_tuple_). If a
+// chained action is still running, is_running() on the HTTP action must return
+// true. Without is_running_next_() this is false — the automation engine sees
+// the script as idle and allows re-entry while the next step executes.
+
+TEST(HttpRequestAsync, IsRunningPropagatesIntoChainedActions) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "ok"});
+
+  HttpRequestAsyncSendAction<> action(&comp);
+  action.set_url(TemplatableValue<std::string>("http://example.com"));
+  action.set_method(TemplatableValue<const char *>("GET"));
+
+  MockNextAction next_action;
+  action.set_next(&next_action);
+
+  action.play_complex();
+  EXPECT_TRUE(action.is_running());   // HTTP request in flight
+
+  comp.pump_worker();
+  comp.pump_responses();
+  // on_complete_cb fired: is_waiting_ = false, play_next_() → next_action.play_complex()
+  EXPECT_TRUE(next_action.is_running());   // chained action is now running
+  EXPECT_TRUE(action.is_running());        // must propagate: false || is_running_next_()
+
+  next_action.finish();
+  EXPECT_FALSE(action.is_running());       // chain fully complete
+}
+
 // ── stop() clears is_running() and prevents stale callbacks ──────────────────
 //
-// When stop() is called (e.g. automation aborted), is_running() must return
-// false immediately. Callbacks that arrive later via the response queue must
-// be no-ops (the alive_ guard prevents them from executing).
+// When stop_complex() is called (the real ESPHome calling convention used by
+// the automation engine to abort a script), is_running() must return false
+// immediately. Callbacks that arrive later via the response queue must be
+// no-ops (the alive_ guard prevents them from executing).
 
 TEST(HttpRequestAsync, StopClearsIsRunningAndSuppressesCallbacks) {
   MockHttpRequestAsyncComponent comp;
@@ -647,8 +708,8 @@ TEST(HttpRequestAsync, StopClearsIsRunningAndSuppressesCallbacks) {
   action.play_complex();
   EXPECT_TRUE(action.is_running());
 
-  action.stop();
-  EXPECT_FALSE(action.is_running());   // is_waiting_ set to false by stop()
+  action.stop_complex();               // real ESPHome calling convention
+  EXPECT_FALSE(action.is_running());   // is_waiting_ = false, num_running_ = 0
 
   // The request is still in flight — process it and verify is_running() stays false
   // and no callback reinstates is_waiting_ = true (alive_ guard blocks on_complete_cb).
