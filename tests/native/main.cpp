@@ -70,7 +70,6 @@ class MockHttpRequestAsyncComponent : public HttpRequestAsyncComponent {
   void execute_request_(PendingRequest *req) override {
     auto container = std::make_shared<HttpContainer>();
     container->status_code = this->next_response_.status_code;
-    container->body = this->next_response_.body;
     // Derive success from HTTP status code — matches real IDF behaviour:
     //   2xx / 3xx → success (on_response)
     //   4xx / 5xx → failure (on_error)
@@ -80,6 +79,12 @@ class MockHttpRequestAsyncComponent : public HttpRequestAsyncComponent {
     container->response_headers_ = this->next_response_.headers;
     container->duration_ms = 42;
     container->content_length = this->next_response_.body.size();
+    // Mirror the IDF body-reading path: only populate body when capture_response
+    // is set, and truncate at max_response_buffer_size.
+    if (req->capture_response) {
+      const std::string &src = this->next_response_.body;
+      container->body = src.substr(0, std::min(src.size(), req->max_response_buffer_size));
+    }
 
     req->container = container;
 

@@ -42,21 +42,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
       break;
     }
 
-    case HTTP_EVENT_ON_DATA:
-      if (ctx->req->capture_response && evt->data_len > 0) {
-        const size_t remaining =
-            ctx->req->max_response_buffer_size - ctx->container->body.size();
-        if (remaining > 0) {
-          const size_t to_copy =
-              std::min(static_cast<size_t>(evt->data_len), remaining);
-          ctx->container->body.append(static_cast<char *>(evt->data), to_copy);
-          if (to_copy < static_cast<size_t>(evt->data_len)) {
-            ESP_LOGW(TAG, "Response body truncated at %u bytes (max_response_buffer_size)",
-                     ctx->req->max_response_buffer_size);
-          }
-        }
-      }
-      break;
+    // HTTP_EVENT_ON_DATA is NOT fired in the streaming API
+    // (esp_http_client_open / fetch_headers / read). Body data is read
+    // explicitly via esp_http_client_read() below. This event only fires
+    // when using esp_http_client_perform().
 
     default:
       break;
@@ -335,18 +324,28 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
   container->content_length = hdr_len >= 0 ? static_cast<size_t>(hdr_len) : 0;
 
   // ── Read response body (if requested) ─────────────────────────────────
-  // The event handler already collected body chunks into container->body via
-  // HTTP_EVENT_ON_DATA during esp_http_client_fetch_headers. For chunked
-  // responses we need to drain the remaining data.
-  if (req->capture_response && esp_http_client_is_chunked_response(client)) {
+  // esp_http_client_read() works for both Content-Length and chunked responses.
+  // For Content-Length responses the client reads exactly content_length bytes
+  // then returns 0. For chunked responses it decodes the chunks transparently.
+  // This must be called unconditionally when capture_response is set —
+  // is_chunked_response() must NOT gate this loop (that was the previous bug:
+  // non-chunked responses returned an empty body).
+  if (req->capture_response) {
     char buf[256];
     int read_len = 0;
+    bool truncation_warned = false;
     while ((read_len = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
       const size_t remaining_cap =
           req->max_response_buffer_size - container->body.size();
       if (remaining_cap > 0) {
-        container->body.append(buf, std::min(static_cast<size_t>(read_len),
-                                             remaining_cap));
+        const size_t to_copy =
+            std::min(static_cast<size_t>(read_len), remaining_cap);
+        container->body.append(buf, to_copy);
+        if (!truncation_warned && to_copy < static_cast<size_t>(read_len)) {
+          ESP_LOGW(TAG, "Response body truncated at %zu bytes (max_response_buffer_size)",
+                   req->max_response_buffer_size);
+          truncation_warned = true;
+        }
       }
     }
   }
