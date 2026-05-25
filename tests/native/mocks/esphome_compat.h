@@ -177,7 +177,7 @@ class Action {
     this->play_next_(x...);
   }
 
-  virtual bool is_running() { return this->num_running_ > 0; }
+  virtual bool is_running() { return this->num_running_ > 0 || this->is_running_next_(); }
 
   // stop() cleans up this action's state only.
   // Chain propagation is handled by stop_complex() below.
@@ -212,6 +212,13 @@ class Action {
   void stop_next_() {
     if (this->next_)
       this->next_->stop_complex();
+  }
+
+  // Returns true if any action in the remainder of the chain is still running.
+  // Mirrors the real ESPHome Action::is_running_next_(). Used by async action
+  // overrides so that is_running() stays true while chained actions execute.
+  bool is_running_next_() {
+    return this->next_ != nullptr && this->next_->is_running();
   }
 
   Action<Ts...> *next_{nullptr};
