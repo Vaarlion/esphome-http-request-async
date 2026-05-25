@@ -144,6 +144,28 @@ class TestHubSchema:
         assert result["buffer_size_rx"] == 1024
         assert result["buffer_size_tx"] == 512
 
+    def test_default_task_count(self):
+        schema = _get_schema()
+        result = schema({})
+        assert result["task_count"] == 1
+
+    def test_custom_task_count(self):
+        schema = _get_schema()
+        result = schema({"task_count": 3})
+        assert result["task_count"] == 3
+
+    def test_invalid_task_count_zero(self):
+        import esphome.config_validation as cv
+        schema = _get_schema()
+        with pytest.raises(cv.Invalid):
+            schema({"task_count": 0})  # min is 1
+
+    def test_invalid_task_count_too_high(self):
+        import esphome.config_validation as cv
+        schema = _get_schema()
+        with pytest.raises(cv.Invalid):
+            schema({"task_count": 9})  # max is 8
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Action schema tests

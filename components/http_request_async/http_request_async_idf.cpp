@@ -78,23 +78,29 @@ void HttpRequestAsyncComponent::setup() {
     return;
   }
 
-  const BaseType_t ret = xTaskCreate(
-      HttpRequestAsyncComponent::worker_task_fn,
-      "http_async_worker",
-      this->task_stack_size_,
-      this,
-      this->task_priority_,
-      &this->worker_task_handle_);
+  this->worker_task_handles_.resize(this->task_count_);
+  for (uint8_t i = 0; i < this->task_count_; i++) {
+    char task_name[16];
+    snprintf(task_name, sizeof(task_name), "http_async_w_%u", i);
 
-  if (ret != pdPASS) {
-    ESP_LOGE(TAG, "Failed to create worker task (stack=%u, priority=%u)",
-             this->task_stack_size_, this->task_priority_);
-    this->mark_failed();
-    return;
+    const BaseType_t ret = xTaskCreate(
+        HttpRequestAsyncComponent::worker_task_fn,
+        task_name,
+        this->task_stack_size_,
+        this,
+        this->task_priority_,
+        &this->worker_task_handles_[i]);
+
+    if (ret != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create worker task %u/%u (stack=%u, priority=%u)",
+               i + 1, this->task_count_, this->task_stack_size_, this->task_priority_);
+      this->mark_failed();
+      return;
+    }
   }
 
-  ESP_LOGD(TAG, "Worker task started (stack=%u, priority=%u)",
-           this->task_stack_size_, this->task_priority_);
+  ESP_LOGD(TAG, "Started %u worker task(s) (stack=%u each, priority=%u)",
+           this->task_count_, this->task_stack_size_, this->task_priority_);
 }
 
 void HttpRequestAsyncComponent::loop() {
@@ -131,7 +137,10 @@ void HttpRequestAsyncComponent::dump_config() {
                 this->ca_certificate_.empty() ? "no" : "yes");
   ESP_LOGCONFIG(TAG, "  RX buffer:        %u bytes", this->buffer_size_rx_);
   ESP_LOGCONFIG(TAG, "  TX buffer:        %u bytes", this->buffer_size_tx_);
-  ESP_LOGCONFIG(TAG, "  Worker stack:     %u bytes", this->task_stack_size_);
+  ESP_LOGCONFIG(TAG, "  Worker tasks:     %u", this->task_count_);
+  ESP_LOGCONFIG(TAG, "  Worker stack:     %u bytes each (~%u kB total)",
+                this->task_stack_size_,
+                (this->task_count_ * this->task_stack_size_ + 512) / 1024);
   ESP_LOGCONFIG(TAG, "  Worker priority:  %u", this->task_priority_);
   ESP_LOGCONFIG(TAG, "  User-Agent:       %s", this->useragent_.c_str());
 }
@@ -301,9 +310,29 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
   }
 
   // ── Fetch response headers ─────────────────────────────────────────────
-  container->content_length =
-      static_cast<size_t>(esp_http_client_fetch_headers(client));
+  const int64_t hdr_len = esp_http_client_fetch_headers(client);
   container->status_code = esp_http_client_get_status_code(client);
+
+  // status_code <= 0 means we never received an HTTP response:
+  // the socket timed out, DNS failed, TLS handshake failed, connection was reset,
+  // or the server hung up. hdr_len can be -1 for both "chunked response" (success)
+  // and "transport error", so status_code is the reliable discriminator.
+  if (container->status_code <= 0) {
+    ESP_LOGW(TAG, "HTTP transport error (status=%d) for %s",
+             container->status_code, req->url.c_str());
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    container->success = false;
+    container->duration_ms =
+        static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
+    if (xQueueSend(this->response_queue_, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
+      ESP_LOGE(TAG, "Response queue full — request to %s leaked", req->url.c_str());
+      delete req;  // NOLINT
+    }
+    return;
+  }
+  // hdr_len is -1 for chunked responses (no Content-Length), >= 0 for known sizes.
+  container->content_length = hdr_len >= 0 ? static_cast<size_t>(hdr_len) : 0;
 
   // ── Read response body (if requested) ─────────────────────────────────
   // The event handler already collected body chunks into container->body via
@@ -324,7 +353,10 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
 
   container->duration_ms =
       static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
-  container->success = true;
+  // 2xx / 3xx → success (on_response fires)
+  // 4xx / 5xx → failure (on_error fires)
+  // Transport failure is handled by the early-return paths above (success stays false).
+  container->success = (container->status_code >= 200 && container->status_code < 400);
 
   ESP_LOGD(TAG, "%s %s → %d (%u ms, %u bytes)", req->method.c_str(),
            req->url.c_str(), container->status_code, container->duration_ms,
