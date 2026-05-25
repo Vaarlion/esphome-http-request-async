@@ -333,6 +333,13 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
       *this->alive_ = false;
     }
     this->is_waiting_ = false;
+    // num_running_ is reset to 0 by the base class stop_complex() immediately
+    // after calling stop(). Resetting it here too makes stop() safe for callers
+    // (e.g. unit tests) that invoke stop() directly rather than stop_complex().
+    // play_next_tuple_() checks num_running_ > 0 before advancing the chain,
+    // so an alive-guard-suppressed on_complete_cb can no longer decrement it
+    // below zero via a double-call to play_next_().
+    this->num_running_ = 0;
   }
 
  protected:
