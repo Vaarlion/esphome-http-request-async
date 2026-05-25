@@ -81,9 +81,39 @@ http_request_async:
   buffer_size_tx: 512           # IDF HTTP transmit buffer in bytes (default: 512)
   task_stack_size: 8192         # worker task stack in bytes (default: 8192)
   task_priority: 5              # FreeRTOS priority 1-24 (default: 5)
+  task_count: 1                 # concurrent worker tasks 1-8 (default: 1)
   useragent: "MyDevice/1.0"     # optional; defaults to ESPHome/<version>
   ca_certificate_path: ca.pem   # optional PEM for custom/self-signed TLS
 ```
+
+## Concurrency and RAM cost
+
+Each worker task processes one request at a time. With `task_count: 1` (the default),
+requests are serialised — a 10-second timeout on one request blocks all others for 10 s.
+With `task_count: N`, up to N requests run simultaneously.
+
+**RAM cost:** each worker allocates exactly `task_stack_size` bytes of DRAM at boot,
+regardless of whether it is idle or busy.
+
+| `task_count` | DRAM (default 8 kB stack) | Concurrent requests | Typical use case |
+|:---:|---:|:---:|---|
+| 1 (default) | 8 kB | 1 | Single periodic poll |
+| 2 | 16 kB | 2 | One slow + one fast request in parallel |
+| 3 | 24 kB | 3 | Mixed workloads (REST + telemetry + OTA check) |
+| 4 | 32 kB | 4 | Heavily loaded device, multiple independent APIs |
+
+The ESP32 has 320 kB of DRAM, shared with the FreeRTOS kernel, network stack,
+BLE, ESPHome components, and application globals. Typical available heap at boot
+is 180–250 kB depending on what else is enabled.
+
+**Rule of thumb for a heavily-loaded ESP32 with BLE proxy:**
+`task_count: 2` (16 kB overhead) is sufficient for most workloads. Use `task_count: 3`
+or `4` only if you regularly fire requests from multiple independent automations that
+might overlap. Going beyond 4 is rarely beneficial — HTTP requests are typically
+network-bound, not CPU-bound, and a 10 s timeout on N tasks still only costs 10 s.
+
+The pending-request queue holds 8 entries regardless of `task_count`. Requests
+beyond that are dropped immediately with `on_error`.
 
 ## Actions
 

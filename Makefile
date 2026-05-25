@@ -10,6 +10,9 @@
 #   make test-native  → C++ unit tests only (fastest, no ESPHome needed)
 #   make test-python  → Python schema tests only  (runs make init if needed)
 #   make compile      → esphome compile (full codegen + C++ compile, no flash)
+#   make flash        → compile + OTA flash + tail logs  (needs secrets.yaml)
+#   make compile-device → compile device_test.yaml only  (needs secrets.yaml)
+#   make logs         → tail device logs without flashing
 #   make clean        → remove build artefacts (keeps .venv)
 #   make clean-venv   → remove .venv  (forces a fresh pip install on next init)
 #   make rebuild      → clean + test
@@ -22,6 +25,13 @@ NATIVE_RUNNER  := $(NATIVE_BUILD)/test_runner
 NATIVE_CMAKE   := tests/native
 ESPHOME_CONFIG := tests/esphome/test_config.yaml
 PYTHON_TESTS   := tests/python/
+
+# Device test (Tier 4 — hardware, requires secrets.yaml)
+DEVICE_CONFIG  := tests/esphome/device_test.yaml
+DEVICE_SECRETS := tests/esphome/secrets.yaml
+# Optional: override target device  e.g.  make flash DEVICE=192.168.1.42
+DEVICE      ?=
+DEVICE_FLAG := $(if $(DEVICE),--device $(DEVICE),)
 
 # Auto-detect available parallelism
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
@@ -91,6 +101,34 @@ compile: $(VENV_SENTINEL)  ## ESPHome compile check — codegen + C++ compile, n
 	@$(ESPHOME) compile $(ESPHOME_CONFIG) && \
 	  echo "$(GREEN)Compilation: PASSED$(RESET)" || \
 	  (echo "$(RED)Compilation: FAILED$(RESET)"; exit 1)
+
+# ── Device targets (Tier 4 — hardware) ───────────────────────────────────────
+#
+# Require tests/esphome/secrets.yaml (gitignored).
+# Copy tests/esphome/secrets.yaml.example → tests/esphome/secrets.yaml and fill in.
+
+.PHONY: _check-secrets
+_check-secrets:
+	@test -f $(DEVICE_SECRETS) || ( \
+	  echo "$(RED)Missing: $(DEVICE_SECRETS)$(RESET)"; \
+	  echo "  cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml"; \
+	  echo "  # then fill in wifi_ssid, api_key, ota_password, test_server"; \
+	  exit 1 )
+
+.PHONY: flash
+flash: $(VENV_SENTINEL) _check-secrets  ## Compile + OTA flash + tail logs  [DEVICE=ip optional]
+	@$(ESPHOME) run $(DEVICE_CONFIG) $(DEVICE_FLAG)
+
+.PHONY: compile-device
+compile-device: $(VENV_SENTINEL) _check-secrets  ## Compile device_test.yaml only (local component, no flash)
+	@echo "$(BOLD)── Device test compilation ──$(RESET)"
+	@$(ESPHOME) compile $(DEVICE_CONFIG) && \
+	  echo "$(GREEN)Device compilation: PASSED$(RESET)" || \
+	  (echo "$(RED)Device compilation: FAILED$(RESET)"; exit 1)
+
+.PHONY: logs
+logs: $(VENV_SENTINEL)  ## Tail device logs without flashing  [DEVICE=ip optional]
+	@$(ESPHOME) logs $(DEVICE_CONFIG) $(DEVICE_FLAG)
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
@@ -166,3 +204,9 @@ help:  ## Show this help
 	@echo "  make check-deps    verify all tools are installed"
 	@echo "  make test          run C++ + Python tests"
 	@echo "  make compile       full ESPHome compilation check (~3 min)"
+	@echo ""
+	@echo "$(BOLD)Hardware testing (Tier 4):$(RESET)"
+	@echo "  cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml"
+	@echo "  # fill in wifi_ssid, api_key, ota_password, test_server"
+	@echo "  make flash         compile + OTA flash + tail logs"
+	@echo "  make logs          tail logs without flashing"

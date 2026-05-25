@@ -1,0 +1,207 @@
+substitutions:
+  # ── Replace with your machine's LAN IP and the test_server.py port ──────────
+  test_server: "192.168.1.X:8765"
+
+esphome:
+  name: ble-esp32-proxy-01
+  friendly_name: BLE_ESP32_Proxy_01
+  on_boot:
+    priority: -200   # After WiFi is up
+    then:
+      - delay: 3s
+      - logger.log: "=== http_request_async boot self-test ==="
+      - script.execute: http_test_get
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret API_PASS
+
+ota:
+  - platform: esphome
+    password: !secret OTA_PASS
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+safe_mode:
+  boot_is_good_after: 1min
+  reboot_timeout: 5min
+
+bluetooth_proxy:
+  active: True
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: True
+
+# ── http_request_async ────────────────────────────────────────────────────────
+
+external_components:
+  - source:
+      type: git
+      url: ssh://git@git.gdkprod.com:2222/Vaarlion/esphome-http-request-async.git
+      ref: test/ble-proxy-integration
+    components: [http_request_async]
+
+http_request_async:
+  id: http_client
+  timeout: 10s       # test_server /slow uses 3s; /unreachable will hit this
+  verify_ssl: false
+
+# ── Test scripts ──────────────────────────────────────────────────────────────
+
+script:
+
+  # Test 1 — GET with 3-second server delay.
+  # While this is in flight, BLE scanning and the main loop keep running.
+  - id: http_test_get
+    mode: single
+    then:
+      - logger.log:
+          format: "GET  → http://%s/slow?delay=3  (watch BLE keep scanning)"
+          args: [ '"${test_server}"' ]
+      - http_request_async.get:
+          url: "http://${test_server}/slow?delay=3"
+          capture_response: true
+          collect_headers:
+            - x-server
+          on_response:
+            then:
+              - logger.log:
+                  format: "GET  ← status=%d  %ums  server=%s  body=%s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - response->get_response_header("x-server").c_str()
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "GET  ✗ on_error fired"
+      # This line only runs after the response arrives — proves sequential
+      # automations work correctly despite the async transport.
+      - logger.log: "GET  ✓ next automation step (response already received)"
+
+  # Test 2 — POST with JSON lambda body, 1-second echo delay.
+  - id: http_test_post
+    mode: single
+    then:
+      - logger.log:
+          format: "POST → http://%s/echo"
+          args: [ '"${test_server}"' ]
+      - http_request_async.post:
+          url: "http://${test_server}/echo"
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["device"]  = App.get_name();
+            root["test"]    = "async_post";
+            root["uptime"]  = id(system_uptime).state;
+          on_response:
+            then:
+              - logger.log:
+                  format: "POST ← status=%d  %ums  body=%s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "POST ✗ on_error fired"
+      - logger.log: "POST ✓ next automation step"
+
+  # Test 3 — on_error for HTTP 5xx: /error returns HTTP 500.
+  # HTTP 4xx/5xx fire on_error (not on_response) — on_response only fires for 2xx/3xx.
+  # Use /unreachable to test the timeout path (takes ~10s).
+  - id: http_test_error
+    mode: single
+    then:
+      - logger.log:
+          format: "GET  → http://%s/error  (expect on_error — HTTP 500)"
+          args: [ '"${test_server}"' ]
+      - http_request_async.get:
+          url: "http://${test_server}/error"
+          capture_response: false
+          on_response:
+            then:
+              - logger.log: "GET  ← on_response fired (unexpected for 500)"
+          on_error:
+            then:
+              - logger.log: "GET  ✗ on_error fired — HTTP 500 (correct)"
+      - logger.log: "GET  ✓ error test done"
+
+  # Test 4 — timeout: /unreachable hangs; should hit the 10s timeout.
+  - id: http_test_timeout
+    mode: single
+    then:
+      - logger.log:
+          format: "GET  → http://%s/unreachable  (expect timeout in 10s)"
+          args: [ '"${test_server}"' ]
+      - http_request_async.get:
+          url: "http://${test_server}/unreachable"
+          capture_response: false
+          on_response:
+            then:
+              - logger.log: "GET  ← got response (unexpected)"
+          on_error:
+            then:
+              - logger.log: "GET  ✗ on_error fired — timeout worked"
+      - logger.log: "GET  ✓ timeout test done"
+
+# ── Trigger buttons (visible in Home Assistant) ───────────────────────────────
+
+button:
+  - platform: template
+    name: "HTTP Test: GET slow"
+    icon: mdi:web
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_get
+
+  - platform: template
+    name: "HTTP Test: POST echo"
+    icon: mdi:web
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_post
+
+  - platform: template
+    name: "HTTP Test: error (500)"
+    icon: mdi:web-cancel
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_error
+
+  - platform: template
+    name: "HTTP Test: timeout"
+    icon: mdi:web-cancel
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_timeout
+
+  - platform: safe_mode
+    name: Safe Mode Boot
+    entity_category: diagnostic
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
+
+# ── Existing sensors ──────────────────────────────────────────────────────────
+
+sensor:
+  - platform: uptime
+    id: system_uptime
+    name: Device Uptime
+    icon: mdi:power-settings
+    update_interval: 30s
+    entity_category: diagnostic
+    state_class: total_increasing
+    disabled_by_default: true

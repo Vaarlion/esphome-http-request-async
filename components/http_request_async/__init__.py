@@ -38,6 +38,7 @@ CONF_BUFFER_SIZE_RX = "buffer_size_rx"
 CONF_BUFFER_SIZE_TX = "buffer_size_tx"
 CONF_TASK_STACK_SIZE = "task_stack_size"
 CONF_TASK_PRIORITY = "task_priority"
+CONF_TASK_COUNT = "task_count"
 CONF_REQUEST_HEADERS = "request_headers"
 CONF_COLLECT_HEADERS = "collect_headers"
 CONF_BODY = "body"
@@ -75,6 +76,7 @@ CONFIG_SCHEMA = cv.All(
                 CONF_TASK_STACK_SIZE, default=8192
             ): cv.int_range(min=4096, max=65536),
             cv.Optional(CONF_TASK_PRIORITY, default=5): cv.int_range(min=1, max=24),
+            cv.Optional(CONF_TASK_COUNT, default=1): cv.int_range(min=1, max=8),
             cv.Optional(
                 CONF_USERAGENT,
                 default=f"ESPHome/{__version__} (https://esphome.io)",
@@ -101,6 +103,7 @@ async def to_code(config):
     cg.add(var.set_buffer_size_tx(config[CONF_BUFFER_SIZE_TX]))
     cg.add(var.set_task_stack_size(config[CONF_TASK_STACK_SIZE]))
     cg.add(var.set_task_priority(config[CONF_TASK_PRIORITY]))
+    cg.add(var.set_task_count(config[CONF_TASK_COUNT]))
     cg.add(var.set_useragent(config[CONF_USERAGENT]))
 
     # Re-enable the ESP-IDF HTTP client component (excluded by default to reduce

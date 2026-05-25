@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "esphome/components/json/json_util.h"
-#include "esphome/core/alloc_helpers.h"
 #include "esphome/core/application.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
@@ -44,8 +43,9 @@ class HttpContainer {
   uint32_t duration_ms{0};
   /// Populated only when the action had capture_response: true.
   std::string body;
-  /// false if a transport-level error occurred (network unreachable, DNS failure,
-  /// TLS handshake error, timeout). HTTP ≥ 400 is still success = true.
+  /// true for 2xx / 3xx responses (on_response fires).
+  /// false for transport errors (network unreachable, DNS failure, TLS error, timeout)
+  /// AND for HTTP 4xx / 5xx responses (on_error fires for all of these).
   bool success{false};
 
   /// Case-insensitive response header lookup.
@@ -114,6 +114,7 @@ class HttpRequestAsyncComponent : public Component {
   void set_buffer_size_tx(uint16_t v) { this->buffer_size_tx_ = v; }
   void set_task_stack_size(uint32_t v) { this->task_stack_size_ = v; }
   void set_task_priority(uint8_t v) { this->task_priority_ = v; }
+  void set_task_count(uint8_t v) { this->task_count_ = v; }
   void set_useragent(std::string v) { this->useragent_ = std::move(v); }
   void set_ca_certificate(std::string v) { this->ca_certificate_ = std::move(v); }
 
@@ -132,12 +133,15 @@ class HttpRequestAsyncComponent : public Component {
   uint16_t buffer_size_tx_{512};
   uint32_t task_stack_size_{8192};
   uint8_t task_priority_{5};
+  uint8_t task_count_{1};
   std::string useragent_;
   std::string ca_certificate_;
 
   // ── FreeRTOS ──────────────────────────────────────────────────────────────
-  TaskHandle_t worker_task_handle_{nullptr};
-  /// Main loop → worker: carries PendingRequest* (request pending execution)
+  /// One handle per worker task (size = task_count_ after setup()).
+  std::vector<TaskHandle_t> worker_task_handles_;
+  /// Main loop → worker(s): carries PendingRequest* (request pending execution).
+  /// All worker tasks pull from this single queue (FreeRTOS queues are thread-safe).
   QueueHandle_t request_queue_{nullptr};
   /// Worker → main loop: carries PendingRequest* (request completed)
   QueueHandle_t response_queue_{nullptr};
