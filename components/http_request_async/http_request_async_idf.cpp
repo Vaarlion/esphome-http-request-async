@@ -230,17 +230,19 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
   const bool is_https = req->url.rfind("https:", 0) == 0;
   if (is_https) {
     if (!this->ca_certificate_.empty()) {
+      // Explicit PEM provided — use it regardless of verify_ssl.
       cfg.cert_pem = this->ca_certificate_.c_str();
     } else if (this->verify_ssl_) {
-#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-      cfg.crt_bundle_attach = esp_crt_bundle_attach;
-#endif
-    } else {
-      cfg.skip_cert_common_name_check = true;
+      // Verify against the bundled Mozilla CA store.
 #if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
       cfg.crt_bundle_attach = esp_crt_bundle_attach;
 #endif
     }
+    // verify_ssl: false — leave cert fields empty. TLS verification is
+    // disabled globally via CONFIG_ESP_TLS_INSECURE and
+    // CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY set in to_code(). Attaching
+    // the CA bundle here would contradict that intent and re-enable chain
+    // verification at the mbedTLS layer even when the user expects none.
   }
 
   // ── Open connection ────────────────────────────────────────────────────

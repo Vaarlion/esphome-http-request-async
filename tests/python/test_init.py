@@ -10,9 +10,10 @@ Run:
     pytest tests/python/
 """
 
+import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -284,3 +285,87 @@ class TestSendActionSchema:
         schemas = _get_action_schemas()
         result = schemas["send"]({"url": "http://example.com", "method": "get"})
         assert result["method"] == "GET"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SSL / TLS codegen tests
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The C++ SSL configuration lives inside execute_request_(), which is IDF-only
+# and not reachable by Tier-2 native tests. What IS testable is the Python
+# to_code() function, which controls which sdkconfig options are emitted.
+# Those options are what actually disable or enable TLS verification at the
+# mbedTLS layer — so these tests directly cover the original bug (CA bundle
+# being attached while verification was supposed to be off).
+
+class TestSslCodegen:
+    """Verify that to_code() emits the correct sdkconfig options for TLS."""
+
+    def _run_to_code(self, config_overrides):
+        """
+        Execute to_code() against a real schema-validated config with all ESPHome
+        codegen calls mocked out. Returns the esp32 mock so callers can inspect
+        which add_idf_sdkconfig_option() calls were made.
+        """
+        with patch("components.http_request_async.cg") as mock_cg, \
+             patch("components.http_request_async.esp32") as mock_esp32:
+            mock_var = MagicMock()
+            mock_cg.new_Pvariable.return_value = mock_var
+            mock_cg.register_component = AsyncMock()
+
+            schema = _get_schema()
+            config = schema(config_overrides)
+            asyncio.run(_component().to_code(config))
+
+            return mock_esp32
+
+    def test_verify_ssl_true_attaches_certificate_bundle(self):
+        """verify_ssl: true must enable the bundled Mozilla CA store."""
+        mock_esp32 = self._run_to_code({"verify_ssl": True})
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True
+        )
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_ESP_TLS_INSECURE", False
+        )
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY", False
+        )
+
+    def test_verify_ssl_false_does_not_attach_bundle(self):
+        """
+        verify_ssl: false must NOT set CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=True.
+        Attaching the bundle while also disabling verification is self-defeating:
+        the bundle re-enables cert chain validation at the mbedTLS layer even
+        when the user expects it to be fully off.
+        """
+        mock_esp32 = self._run_to_code({"verify_ssl": False})
+
+        bundle_enabled = [
+            c for c in mock_esp32.add_idf_sdkconfig_option.call_args_list
+            if c == call("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
+        ]
+        assert not bundle_enabled, (
+            "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE must not be True when verify_ssl=false; "
+            f"found calls: {mock_esp32.add_idf_sdkconfig_option.call_args_list}"
+        )
+
+    def test_verify_ssl_false_sets_insecure_flags(self):
+        """verify_ssl: false must set both ESP-IDF insecure options."""
+        mock_esp32 = self._run_to_code({"verify_ssl": False})
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_ESP_TLS_INSECURE", True
+        )
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY", True
+        )
+
+    def test_verify_ssl_true_does_not_set_insecure_flags(self):
+        """verify_ssl: true must not leave the insecure flags enabled."""
+        mock_esp32 = self._run_to_code({"verify_ssl": True})
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_ESP_TLS_INSECURE", False
+        )
+        mock_esp32.add_idf_sdkconfig_option.assert_any_call(
+            "CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY", False
+        )
