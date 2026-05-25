@@ -580,7 +580,16 @@ TEST(HttpRequestAsync, NullCallbacksDoNotCrashOnNetworkDown) {
   network::g_is_connected = true;
 }
 
-// ── content_length reflects the full server payload size ─────────────────────
+// ── content_length reflects the received payload size ────────────────────────
+//
+// For Content-Length responses: set from the header value by the IDF path.
+// For chunked responses: set from body.size() after the read loop (IDF fix).
+// The mock sets content_length = body.size() in both cases, so this test covers
+// the contract that the callback always sees a non-zero content_length when the
+// body was captured — regardless of transfer encoding.
+//
+// Hardware verification: test_chunked_content_length in hardware_test.yaml
+// exercises the real IDF path with a genuine chunked response.
 
 TEST(HttpRequestAsync, ContentLengthMatchesResponseBodySize) {
   MockHttpRequestAsyncComponent comp;

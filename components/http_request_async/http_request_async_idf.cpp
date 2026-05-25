@@ -358,6 +358,16 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
     }
   }
 
+  // For chunked transfer encoding, esp_http_client_fetch_headers() returns -1
+  // (no Content-Length header), so content_length was set to 0 above. After
+  // reading the body, update it to the actual byte count so callers get a
+  // consistent value regardless of whether the server used Content-Length or
+  // chunked encoding. If capture_response was false, content_length stays 0
+  // (we have no byte count to report).
+  if (req->capture_response && container->content_length == 0 && !container->body.empty()) {
+    container->content_length = container->body.size();
+  }
+
   container->duration_ms =
       static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
   // 2xx / 3xx → success (on_response fires)
