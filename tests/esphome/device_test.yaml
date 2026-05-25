@@ -1,0 +1,214 @@
+# ESPHome device test — Tier 4 (hardware).
+#
+# Uses the LOCAL component source (type: local) so you never hit git-caching
+# issues. Any change in components/ is picked up on the next compile.
+#
+# Requires: tests/esphome/secrets.yaml  (gitignored — copy from secrets.yaml.example)
+#
+# Run:
+#   make flash          compile + OTA upload + tail logs
+#   make compile-device compile only (no flash)
+#   make logs           tail logs without flashing
+
+substitutions:
+  device_name:    http-async-dev
+  friendly_name:  HTTP Async Dev
+  board:          esp32dev        # change here if your board differs
+  # test_server comes from secrets.yaml as: test_server: "192.168.x.x:8765"
+  test_server: !secret test_server
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -200
+    then:
+      - delay: 3s
+      - logger.log: "=== http_request_async device test ==="
+      - script.execute: http_test_get
+
+esp32:
+  board: ${board}
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+safe_mode:
+  boot_is_good_after: 1min
+  reboot_timeout: 5min
+
+bluetooth_proxy:
+  active: true
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+# ── Component under test ──────────────────────────────────────────────────────
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+    components: [http_request_async]
+
+http_request_async:
+  id: http_client
+  timeout: 10s
+  verify_ssl: false
+  task_count: 2     # 2 concurrent requests; each adds task_stack_size bytes to DRAM
+
+# ── Test scripts ──────────────────────────────────────────────────────────────
+
+script:
+
+  # Test 1 — GET with 3s server delay.
+  # While in flight the BLE scanner and main loop must keep running.
+  # Expected: on_response with status=200. "next step" line confirms sequencing.
+  - id: http_test_get
+    mode: parallel
+    then:
+      - logger.log: "GET  → http://${test_server}/slow?delay=3"
+      - http_request_async.get:
+          url: "http://${test_server}/slow?delay=3"
+          capture_response: true
+          collect_headers:
+            - x-server
+          on_response:
+            then:
+              - logger.log:
+                  format: "GET  ← status=%d  %ums  server=%s  body=%s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - response->get_response_header("x-server").c_str()
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "GET  ✗ on_error fired  (unexpected)"
+      - logger.log: "GET  ✓ next automation step"
+
+  # Test 2 — POST with JSON lambda body.
+  # Expected: on_response with status=200, body echoed back.
+  - id: http_test_post
+    mode: parallel
+    then:
+      - logger.log: "POST → http://${test_server}/echo"
+      - http_request_async.post:
+          url: "http://${test_server}/echo"
+          capture_response: true
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["device"]  = App.get_name();
+            root["test"]    = "async_post";
+            root["uptime"]  = id(device_uptime).state;
+          on_response:
+            then:
+              - logger.log:
+                  format: "POST ← status=%d  %ums  body=%s"
+                  args:
+                    - response->status_code
+                    - response->duration_ms
+                    - body.c_str()
+          on_error:
+            then:
+              - logger.log: "POST ✗ on_error fired  (unexpected)"
+      - logger.log: "POST ✓ next automation step"
+
+  # Test 3 — HTTP 500: on_error must fire, not on_response.
+  # Expected: on_error fires.
+  - id: http_test_error
+    mode: parallel
+    then:
+      - logger.log: "ERR  → http://${test_server}/error  (expect on_error)"
+      - http_request_async.get:
+          url: "http://${test_server}/error"
+          capture_response: false
+          on_response:
+            then:
+              - logger.log: "ERR  ← on_response fired  ✗ UNEXPECTED"
+          on_error:
+            then:
+              - logger.log: "ERR  ✗ on_error fired  ✓ correct"
+      - logger.log: "ERR  ✓ next automation step"
+
+  # Test 4 — Timeout: /unreachable never responds; must hit 10s timeout → on_error.
+  # Expected: on_error fires after ~10s.
+  - id: http_test_timeout
+    mode: parallel
+    then:
+      - logger.log: "TMO  → http://${test_server}/unreachable  (expect on_error after 10s)"
+      - http_request_async.get:
+          url: "http://${test_server}/unreachable"
+          capture_response: false
+          on_response:
+            then:
+              - logger.log: "TMO  ← on_response fired  ✗ UNEXPECTED"
+          on_error:
+            then:
+              - logger.log: "TMO  ✗ on_error fired  ✓ correct"
+      - logger.log: "TMO  ✓ next automation step"
+
+# ── Home Assistant trigger buttons ───────────────────────────────────────────
+
+button:
+  - platform: template
+    name: "Test: GET slow"
+    icon: mdi:web
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_get
+
+  - platform: template
+    name: "Test: POST echo"
+    icon: mdi:web
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_post
+
+  - platform: template
+    name: "Test: HTTP 500 error"
+    icon: mdi:web-cancel
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_error
+
+  - platform: template
+    name: "Test: Timeout"
+    icon: mdi:web-cancel
+    entity_category: diagnostic
+    on_press:
+      - script.execute: http_test_timeout
+
+  - platform: safe_mode
+    name: Safe Mode Boot
+    entity_category: diagnostic
+
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
+
+# ── Sensors ───────────────────────────────────────────────────────────────────
+
+sensor:
+  - platform: uptime
+    id: device_uptime
+    name: Device Uptime
+    update_interval: 30s
+    entity_category: diagnostic
+    state_class: total_increasing
+    disabled_by_default: true

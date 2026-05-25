@@ -12,6 +12,9 @@ build/
 # ESPHome generated files
 .esphome/
 
+# Device test secrets — copy secrets.yaml.example → secrets.yaml and fill in
+tests/esphome/secrets.yaml
+
 # IDE
 .vscode/
 .idea/
