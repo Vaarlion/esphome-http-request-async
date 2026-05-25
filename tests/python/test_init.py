@@ -167,6 +167,32 @@ class TestHubSchema:
         with pytest.raises(cv.Invalid):
             schema({"task_count": 9})  # max is 8
 
+    def test_task_stack_size_below_minimum(self):
+        """task_stack_size below 4096 must be rejected — too small for a functional FreeRTOS task."""
+        import esphome.config_validation as cv
+        schema = _get_schema()
+        with pytest.raises(cv.Invalid):
+            schema({"task_stack_size": 4095})
+
+    def test_task_stack_size_above_maximum(self):
+        import esphome.config_validation as cv
+        schema = _get_schema()
+        with pytest.raises(cv.Invalid):
+            schema({"task_stack_size": 65537})
+
+    def test_buffer_size_rx_overflow_rejected(self):
+        """buffer_size_rx is a uint16_t; 65536 must be rejected."""
+        import esphome.config_validation as cv
+        schema = _get_schema()
+        with pytest.raises((cv.Invalid, Exception)):
+            schema({"buffer_size_rx": 65536})
+
+    def test_buffer_size_tx_overflow_rejected(self):
+        import esphome.config_validation as cv
+        schema = _get_schema()
+        with pytest.raises((cv.Invalid, Exception)):
+            schema({"buffer_size_tx": 65536})
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Action schema tests

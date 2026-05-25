@@ -47,16 +47,24 @@ constexpr BaseType_t pdPASS = 1;
 inline TickType_t pdMS_TO_TICKS(uint32_t ms) { return ms; }
 
 struct FakeQueue {
+  explicit FakeQueue(uint32_t max_depth) : max_depth_(max_depth) {}
   std::queue<void *> q;
+  uint32_t max_depth_;
 };
 using QueueHandle_t = FakeQueue *;
 
-inline QueueHandle_t xQueueCreate(uint32_t /*depth*/, uint32_t /*item_size*/) {
-  return new FakeQueue();
+inline QueueHandle_t xQueueCreate(uint32_t depth, uint32_t /*item_size*/) {
+  return new FakeQueue(depth);
 }
 
 inline BaseType_t xQueueSend(QueueHandle_t q, const void *item,
-                              TickType_t /*timeout*/) {
+                              TickType_t timeout) {
+  // Non-blocking sends (timeout == 0) respect the depth limit, matching real
+  // FreeRTOS behaviour. Blocking sends (portMAX_DELAY or any non-zero timeout)
+  // always succeed — the mock has no scheduler to actually block on.
+  if (timeout == 0 && q->q.size() >= q->max_depth_) {
+    return pdFALSE;
+  }
   void *val = nullptr;
   std::memcpy(&val, item, sizeof(void *));
   q->q.push(val);

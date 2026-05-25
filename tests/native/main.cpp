@@ -284,21 +284,43 @@ TEST(HttpRequestAsync, OnCompleteFiresAfterHttpError) {
 }
 
 // ── Response body is truncated at max_response_buffer_size ───────────────────
+// The mock honours max_response_buffer_size the same way the real IDF path does.
 
 TEST(HttpRequestAsync, BodyTruncatedAtMaxBufferSize) {
   MockHttpRequestAsyncComponent comp;
-  comp.set_next_response({200, "01234567890123456789"});
+  comp.set_next_response({200, "01234567890123456789"});  // 20 bytes
 
+  std::string captured_body;
   auto *req = make_request();
+  req->capture_response = true;
   req->max_response_buffer_size = 5;
-  req->on_response_cb = [](std::shared_ptr<HttpContainer>) {};
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    captured_body = c->body;
+  };
 
   comp.enqueue_request(req);
   comp.tick();
 
-  // The mock sets body directly; real truncation happens in the event handler.
-  // This test verifies max_response_buffer_size is passed through correctly.
-  EXPECT_EQ(req->max_response_buffer_size, 5u);
+  EXPECT_EQ(captured_body, "01234");           // exactly 5 bytes
+  EXPECT_EQ(captured_body.size(), 5u);
+}
+
+// ── capture_response: false leaves body empty regardless of server payload ────
+
+TEST(HttpRequestAsync, NoCaptureResponseLeavesBodyEmpty) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "this should not appear"});
+
+  std::string captured_body = "sentinel";
+  auto *req = make_request("http://example.com", "GET", /*capture=*/false);
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    captured_body = c->body;
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(captured_body, "");
 }
 
 // ── Response header collection is case-insensitive ────────────────────────────
@@ -366,20 +388,45 @@ TEST(HttpRequestAsync, OnErrorWhenNotConnected) {
 }
 
 // ── alive flag: callbacks are no-ops after stop() ────────────────────────────
+//
+// Simulates the sequence that occurs when an automation is aborted while an
+// HTTP request is in flight: stop() clears alive_, the request finishes and
+// arrives in the response queue, but loop() should fire nothing.
 
 TEST(HttpRequestAsync, AliveGuardPreventsStaleCallbacks) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "ok"});
+
   auto alive = std::make_shared<bool>(true);
   bool response_called = false;
+  bool error_called = false;
+  bool complete_called = false;
 
-  auto on_response = [&alive, &response_called](std::shared_ptr<HttpContainer>) {
+  auto *req = make_request();
+  req->on_response_cb = [alive, &response_called](std::shared_ptr<HttpContainer>) {
     if (!*alive) return;
     response_called = true;
   };
+  req->on_error_cb = [alive, &error_called]() {
+    if (!*alive) return;
+    error_called = true;
+  };
+  req->on_complete_cb = [alive, &complete_called]() {
+    if (!*alive) return;
+    complete_called = true;
+  };
 
+  comp.enqueue_request(req);
+  comp.pump_worker();    // request processed; now sitting in response_queue
+
+  // Simulate stop() clearing the alive flag before loop() runs.
   *alive = false;
-  on_response(std::make_shared<HttpContainer>());
+
+  comp.pump_responses(); // should all be no-ops
 
   EXPECT_FALSE(response_called);
+  EXPECT_FALSE(error_called);
+  EXPECT_FALSE(complete_called);
 }
 
 // ── Duration is populated ─────────────────────────────────────────────────────
@@ -400,17 +447,79 @@ TEST(HttpRequestAsync, DurationIsReported) {
   EXPECT_EQ(duration, 42u);
 }
 
-// ── PendingRequest correctly stores collect_headers ──────────────────────────
+// ── Collected response headers are accessible via get_response_header() ───────
+//
+// Verifies the full round-trip: header set in mock response → accessible in
+// on_response callback → get_response_header() returns it case-insensitively.
+// The mock populates container->response_headers_ directly; in the real IDF
+// path the event handler does this after filtering against lower_case_collect_headers.
 
-TEST(HttpRequestAsync, CollectHeadersStoredLowerCase) {
+TEST(HttpRequestAsync, CollectedResponseHeaderAccessibleInCallback) {
+  MockHttpRequestAsyncComponent comp;
+  MockResponse resp;
+  resp.status_code = 200;
+  resp.body = "ok";
+  resp.headers = {{"content-type", "application/json"}, {"x-request-id", "abc-123"}};
+  comp.set_next_response(resp);
+
+  std::string captured_ct;
+  std::string captured_rid;
+  std::string captured_missing;
+
   auto *req = make_request();
   req->lower_case_collect_headers = {"content-type", "x-request-id"};
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    // Case-insensitive lookups — all three casings must return the same value.
+    captured_ct      = c->get_response_header("Content-Type");
+    captured_rid     = c->get_response_header("X-Request-Id");
+    captured_missing = c->get_response_header("X-Not-Present");
+  };
 
-  EXPECT_EQ(req->lower_case_collect_headers.size(), 2u);
-  EXPECT_EQ(req->lower_case_collect_headers[0], "content-type");
-  EXPECT_EQ(req->lower_case_collect_headers[1], "x-request-id");
+  comp.enqueue_request(req);
+  comp.tick();
 
-  delete req;
+  EXPECT_EQ(captured_ct, "application/json");
+  EXPECT_EQ(captured_rid, "abc-123");
+  EXPECT_EQ(captured_missing, "");           // absent header → empty string
+}
+
+// ── Request queue overflow fires on_error immediately ────────────────────────
+//
+// The request queue has a fixed depth of QUEUE_DEPTH (8). When it is full,
+// enqueue_request() must fire on_error synchronously and delete the request —
+// the automation must not stall waiting for a slot that will never open.
+
+TEST(HttpRequestAsync, QueueFullDropsRequestWithOnError) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "ok"});
+
+  int error_count    = 0;
+  int response_count = 0;
+
+  // Fill the queue to capacity without draining (pump_worker is NOT called).
+  for (int i = 0; i < 8; i++) {
+    auto *req = make_request();
+    req->on_response_cb = [&](std::shared_ptr<HttpContainer>) { response_count++; };
+    req->on_error_cb    = [&]() { error_count++; };
+    comp.enqueue_request(req);
+  }
+  EXPECT_EQ(error_count, 0);    // all 8 fit
+  EXPECT_EQ(response_count, 0); // nothing processed yet
+
+  // 9th request: queue is full → on_error fires synchronously, no on_response.
+  bool ninth_error    = false;
+  bool ninth_response = false;
+  auto *req9 = make_request();
+  req9->on_error_cb    = [&]() { ninth_error = true; };
+  req9->on_response_cb = [&](std::shared_ptr<HttpContainer>) { ninth_response = true; };
+  comp.enqueue_request(req9);
+
+  EXPECT_TRUE(ninth_error);
+  EXPECT_FALSE(ninth_response);
+
+  // Drain the 8 enqueued requests to avoid leaking PendingRequest objects.
+  comp.pump_worker();
+  comp.pump_responses();
 }
 
 // ── Multiple requests enqueued at once; all processed in one pump ─────────────
@@ -438,6 +547,115 @@ TEST(HttpRequestAsync, ConcurrentEnqueueAndDrain) {
   comp.pump_responses();
 
   EXPECT_EQ(callbacks_fired, N);
+}
+
+// ── Null callbacks do not crash loop() ───────────────────────────────────────
+//
+// A user who writes an HTTP action with no on_response and no on_error gets
+// null std::function objects in the PendingRequest. loop() guards each with
+// if (req->on_...) — removing any one of those guards would silently become
+// a call through a null std::function (UB / crash).
+
+TEST(HttpRequestAsync, NullCallbacksDoNotCrashLoop) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "ok"});
+
+  auto *req = make_request();
+  // All callbacks left as default-constructed (null) std::functions.
+  comp.enqueue_request(req);
+  comp.tick();  // must not crash or invoke UB
+}
+
+// ── Null callbacks do not crash enqueue_request() on network-down ─────────────
+
+TEST(HttpRequestAsync, NullCallbacksDoNotCrashOnNetworkDown) {
+  network::g_is_connected = false;
+
+  MockHttpRequestAsyncComponent comp;
+  auto *req = make_request();
+  // on_error_cb and on_complete_cb are null — enqueue_request() must guard
+  // both before calling them in the network-down fast-path.
+  comp.enqueue_request(req);  // must not crash
+
+  network::g_is_connected = true;
+}
+
+// ── content_length reflects the full server payload size ─────────────────────
+
+TEST(HttpRequestAsync, ContentLengthMatchesResponseBodySize) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "hello world"});  // 11 bytes
+
+  size_t captured_content_length = 0;
+  auto *req = make_request();
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    captured_content_length = c->content_length;
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(captured_content_length, 11u);
+}
+
+// ── is_running() follows the request lifecycle ────────────────────────────────
+//
+// is_running() returns is_waiting_, which must be:
+//   false  → before play_complex() is called
+//   true   → after play_complex() returns (request enqueued but not dispatched)
+//   true   → after worker processes request (response in queue, loop() not yet run)
+//   false  → after loop() fires on_complete_cb (is_waiting_ set to false there)
+//
+// ESPHome's automation engine uses is_running() to gate re-entry for scripts
+// with mode: single. An incorrect value would cause either a stalled script or
+// overlapping concurrent executions.
+
+TEST(HttpRequestAsync, IsRunningFollowsRequestLifecycle) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "ok"});
+
+  HttpRequestAsyncSendAction<> action(&comp);
+  action.set_url(TemplatableValue<std::string>("http://example.com"));
+  action.set_method(TemplatableValue<const char *>("GET"));
+
+  EXPECT_FALSE(action.is_running());   // idle
+
+  action.play_complex();
+  EXPECT_TRUE(action.is_running());    // enqueued, awaiting response
+
+  comp.pump_worker();
+  EXPECT_TRUE(action.is_running());    // response in queue, loop() not yet called
+
+  comp.pump_responses();
+  EXPECT_FALSE(action.is_running());   // on_complete_cb fired: is_waiting_ = false
+}
+
+// ── stop() clears is_running() and prevents stale callbacks ──────────────────
+//
+// When stop() is called (e.g. automation aborted), is_running() must return
+// false immediately. Callbacks that arrive later via the response queue must
+// be no-ops (the alive_ guard prevents them from executing).
+
+TEST(HttpRequestAsync, StopClearsIsRunningAndSuppressesCallbacks) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "ok"});
+
+  HttpRequestAsyncSendAction<> action(&comp);
+  action.set_url(TemplatableValue<std::string>("http://example.com"));
+  action.set_method(TemplatableValue<const char *>("GET"));
+
+  action.play_complex();
+  EXPECT_TRUE(action.is_running());
+
+  action.stop();
+  EXPECT_FALSE(action.is_running());   // is_waiting_ set to false by stop()
+
+  // The request is still in flight — process it and verify is_running() stays false
+  // and no callback reinstates is_waiting_ = true (alive_ guard blocks on_complete_cb).
+  comp.pump_worker();
+  comp.pump_responses();
+
+  EXPECT_FALSE(action.is_running());
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
