@@ -47,7 +47,7 @@ esp32_ble_tracker:
 external_components:
   - source:
       type: git
-      url: ssh://git@git.gdkprod.com:2222/Vaarlion/esphome-http-request-async.git
+      url: https://github.com/Vaarlion/esphome-http-request-async.git
       ref: test/ble-proxy-integration
     components: [http_request_async]
 
