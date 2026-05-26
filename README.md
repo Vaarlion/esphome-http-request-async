@@ -115,7 +115,7 @@ http_request_async:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `timeout` | `4.5s` | Fires `on_error` when exceeded. |
-| `verify_ssl` | `true` | Set `false` for self-signed certs or plain HTTP. |
+| `verify_ssl` | `true` | Set `false` for self-signed certs or plain HTTP. See [note below](#verify_ssl-false-and-sdkconfig). |
 | `follow_redirects` | `true` | |
 | `redirect_limit` | `3` | |
 | `buffer_size_rx` | `512` | Increase if server returns large headers. |
@@ -341,6 +341,80 @@ All configuration keys carry over unchanged.
 requests — including 4xx/5xx — through `on_response`. This component routes
 4xx/5xx through `on_error` instead. Adjust any `on_response` handlers that
 currently check `response->status_code >= 400`.
+
+---
+
+## Known limitations
+
+### No per-request TLS configuration
+
+TLS is configured at the hub level, not per request. All requests share the
+same `verify_ssl` setting and `ca_certificate_path`. Per-request CA
+certificates are not supported.
+
+If you need to talk to both verified and unverified endpoints, declare two hub
+instances with different `verify_ssl` settings and route requests accordingly.
+
+### No request cancellation
+
+Once a request is enqueued it runs to completion or until it times out. Calling
+`stop_complex()` on the action (or aborting the parent script) suppresses the
+callbacks via the alive-flag mechanism but does not abort the underlying network
+transfer — the worker task keeps running.
+
+### JSON `dict` form: string values only
+
+The `json:` key–value shorthand only accepts string values:
+
+```yaml
+- http_request_async.post:
+    json:
+      state: "ON"       # fine
+      brightness: "128" # fine — must be a string
+```
+
+For integers, booleans, arrays, or nested objects, use the lambda form instead:
+
+```yaml
+- http_request_async.post:
+    json: |-
+      root["brightness"] = 128;
+      root["enabled"] = true;
+      root["tags"][0] = "sensor";
+```
+
+### Response body truncation is invisible to the callback
+
+When `capture_response: true` and the response exceeds `max_response_buffer_size`,
+the body is silently truncated and a `WARN` is logged — but the callback receives
+no `body_truncated` flag or indication that the data is incomplete. JSON parse
+failures are the typical symptom. See
+[Response body buffering](#response-body-buffering) for size guidance.
+
+### Request queue depth is fixed at 8
+
+The pending-request queue holds 8 entries. A 9th enqueue fires `on_error`
+immediately and drops the request. See [Concurrency](#concurrency) for
+sizing and mitigation strategies.
+
+### `verify_ssl: false` depends on sdkconfig
+
+`verify_ssl: false` works by emitting two sdkconfig flags at compile time:
+`CONFIG_ESP_TLS_INSECURE` and `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY`. These
+tell mbedTLS to skip the certificate chain check at the TLS layer.
+
+If your project has a custom `sdkconfig.defaults` or `sdkconfig.override` that
+re-enables server certificate verification or otherwise conflicts with these
+flags, the conflict is resolved silently at build time by the ESP-IDF Kconfig
+merge rules. Your YAML will say `verify_ssl: false` but TLS verification will
+still be active.
+
+**Symptom:** connections to servers with self-signed certificates fail with a
+TLS handshake error even though `verify_ssl: false` is set.
+
+**Fix:** inspect your custom sdkconfig files for `CONFIG_ESP_TLS_VERIFY_*` or
+`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE` entries that re-enable verification, and
+remove or reconcile them.
 
 ---
 
