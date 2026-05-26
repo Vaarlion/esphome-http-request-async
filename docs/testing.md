@@ -29,16 +29,20 @@ The component has a hard split between testable and non-testable logic:
 - `is_running()` lifecycle: true while in flight, false after complete/stop
 - `is_running()` chain propagation: true while a chained action executes
 
+**Testable via IDF mock (Tier 2, `IdfMockHttpRequestAsyncComponent`)**
+- Redirect-following loop: hop count, limit enforcement, 302/307 method handling,
+  missing-Location-header behaviour, intermediate header clearing
+
 **Cannot be tested without hardware (Tier 4 only)**
-- The entire `execute_request_()` IDF path:
-  - HTTP method → IDF enum mapping
-  - Request headers reaching the server
-  - Response body read loop (Content-Length and chunked encoding)
+- The real network path in `execute_request_()`:
+  - HTTP method → IDF enum mapping reaching an actual server
+  - Request headers transmitted over the wire
+  - Response body read loop (Content-Length and chunked encoding from a real server)
   - `content_length` updated from body for chunked responses
   - Truncation: body capped at `max_response_buffer_size`, warning logged
   - `collect_headers` filter: un-requested headers discarded at the event handler
   - TLS handshake, CA bundle validation, `verify_ssl: false` behaviour
-  - Redirect following
+  - Real redirect chains (real Location headers, real TCP connections per hop)
   - Real timing: `duration_ms` reflects actual wall-clock HTTP time
 
 ---
@@ -77,9 +81,11 @@ HTTP. Runs in a few seconds on the development machine.
 
 ### How it works
 
-`MockHttpRequestAsyncComponent` overrides `execute_request_()` to inject a
-predefined response. FreeRTOS queues are replaced by `std::queue` wrappers in
-`tests/native/mocks/esphome_compat.h`.
+Two test component classes are available:
+
+**`MockHttpRequestAsyncComponent`** — overrides `execute_request_()` to inject a
+predefined response directly. FreeRTOS queues are replaced by `std::queue`
+wrappers. Use this for testing callback routing, lifecycle, and queue behaviour.
 
 ```cpp
 MockHttpRequestAsyncComponent comp;
@@ -92,18 +98,38 @@ comp.enqueue_request(req);
 comp.tick();   // pump_worker() then pump_responses() — simulates one loop cycle
 ```
 
+**`IdfMockHttpRequestAsyncComponent`** — does NOT override `execute_request_()`.
+The real IDF implementation runs; all `esp_http_client_*` calls are intercepted by
+`idf_http_mock.cpp`. Control the response sequence and inspect call counts via
+`g_idf_mock`. Use this for testing IDF-level logic (redirect loop, method
+switching, header clearing).
+
+```cpp
+g_idf_mock.reset();
+g_idf_mock.push_statuses({302, 302, 200});  // simulate two redirect hops
+
+IdfMockHttpRequestAsyncComponent comp;
+comp.enqueue_request(req);
+comp.tick();
+
+EXPECT_EQ(g_idf_mock.set_redirection_call_count, 2);
+```
+
 ### What's covered
+
+**Callback routing / lifecycle (MockHttpRequestAsyncComponent)**
 
 | Test | What it verifies |
 |------|-----------------|
 | `OnResponseCalledOnSuccess` | on_response fires for 2xx |
 | `OnErrorCalledOnTransportFailure` | on_error fires when status=0 |
 | `OnErrorCalledOnHttpClientError` | on_error fires for 4xx |
-| `OnErrorCalledOnServerError` | on_error fires for 5xx |
-| `OnResponseCalledOnRedirect` | on_response fires for 3xx |
-| `OnCompleteAlwaysFires` | on_complete fires after success |
-| `OnCompleteAlwaysFiresOnError` | on_complete fires after error |
-| `NetworkDownCallsOnError` | on_error fires immediately when WiFi is down |
+| `OnErrorCalledOnHttpServerError` | on_error fires for 5xx |
+| `OnResponseCalledOn3xxRedirect` | on_response fires for 3xx (unhandled redirect) |
+| `OnCompleteFiresAfterOnResponse` | on_complete fires after on_response |
+| `OnCompleteFiresAfterOnError` | on_complete fires after on_error |
+| `OnCompleteFiresAfterHttpError` | on_complete fires after HTTP 4xx/5xx |
+| `OnErrorWhenNotConnected` | on_error fires immediately when WiFi is down |
 | `BodyTruncatedAtMaxBufferSize` | captured body capped at max_response_buffer_size |
 | `NoCaptureResponseLeavesBodyEmpty` | body stays empty when capture_response=false |
 | `AliveGuardPreventsStaleCallbacks` | callbacks suppressed after stop() clears alive_ |
@@ -118,7 +144,20 @@ comp.tick();   // pump_worker() then pump_responses() — simulates one loop cyc
 | `IsRunningPropagatesIntoChainedActions` | is_running() true while chained action runs (mode:single) |
 | `StopClearsIsRunningAndSuppressesCallbacks` | stop_complex() clears is_running(), blocks callbacks |
 
-When to run: any change to `http_request_async.h` or logic in `loop()` / `enqueue_request()`.
+**IDF redirect loop (IdfMockHttpRequestAsyncComponent)**
+
+| Test | What it verifies |
+|------|-----------------|
+| `IdfRedirectChainFollowed` | 302×3 → 200: on_response fires with final status; correct hop count |
+| `IdfRedirectLimitEnforced` | limit=3 with 5×302: stops at 4th hop, surfaces 302 via on_response |
+| `IdfRedirectNotFollowedWhenDisabled` | follow_redirects=false: 302 returned as-is, set_redirection not called |
+| `IdfRedirectStopsOnMissingLocation` | set_redirection() returns ESP_FAIL: response treated as final |
+| `IdfRedirect302SwitchesToGetDropsBody` | POST + 302 → GET: second open() has write_len=0; set_method not called |
+| `IdfRedirect307PreservesMethod` | POST + 307: set_method() called to restore POST; body resent |
+| `IdfRedirectClearsIntermediateHeaders` | headers from redirect hops cleared; final-hop headers accessible |
+
+When to run: any change to `http_request_async.h`, `http_request_async_idf.cpp`,
+or logic in `loop()` / `enqueue_request()`.
 
 ---
 
@@ -141,67 +180,59 @@ Run before every commit that touches `.h`, `.cpp`, or `__init__.py`.
 
 ## Tier 4 — Hardware testing
 
-Flash a real ESP32 and trigger scripts to verify the IDF execution path with
-real HTTP calls. Required before tagging a release.
-
-### Test config
-
-`tests/esphome/hardware_test.yaml` — purpose-built for runtime edge-case testing.
-It has two hub instances (`http_client` with `verify_ssl: false` for HTTP/insecure
-HTTPS, `https_client` with `verify_ssl: true` for CA-validated HTTPS) and one
-script per scenario.
+Flash a real ESP32 and watch it run the full test suite automatically.
+No Home Assistant, no dashboard interaction required.
 
 ### Setup
 
-**1. Run httpbin locally** (most tests use it):
+**1. Start the test server** on your dev machine:
 
 ```bash
-docker run -p 8000:80 kennethreitz/httpbin
+python3 tools/test_server.py          # listens on port 8765
 ```
 
-**2. Set `httpbin_host`** in the YAML to your machine's LAN IP:
-
-```yaml
-globals:
-  - id: httpbin_host
-    initial_value: '"192.168.1.42:8000"'
-```
-
-**3. Create `tests/esphome/secrets.yaml`** (gitignored):
-
-```yaml
-wifi_ssid: "YourSSID"
-wifi_password: "YourPassword"
-```
-
-**4. Flash and tail logs:**
+**2. Create `tests/esphome/secrets.yaml`** (gitignored):
 
 ```bash
-esphome run tests/esphome/hardware_test.yaml
+cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml
+# fill in: wifi_ssid, wifi_password, api_key, ota_password
+# set test_server to your dev machine's LAN IP:8765
 ```
 
-### Hardware test scenarios
+**3. Flash and watch:**
 
-Trigger each script manually (HA service call or ESPHome dashboard).
-Look for `[PASS]` / `[FAIL]` in the logs.
+```bash
+make flash                  # compile + OTA flash + tail logs
+# or, if the device is already running:
+make logs                   # just tail the logs
+```
 
-| Script | What it verifies | Log prefix |
-|--------|-----------------|------------|
-| `test_truncation` | Body capped at 64 B; LOGW emitted; `content_length` still reflects full response | `[TRUNCATION]` |
-| `test_chunked_content_length` | Chunked response: `content_length == body.size()` (not 0) | `[CHUNKED]` |
-| `test_collect_headers_filter` | Requested header present; un-requested header absent | `[HEADERS FILTER]` |
-| `test_request_header_injection` | Custom request header echoed by server | `[HDR INJECT]` |
-| `test_delete_method` | DELETE returns 200 | `[DELETE]` |
-| `test_patch_method` | PATCH returns 200; body echoed | `[PATCH]` |
-| `test_redirect` | 3 redirects followed; final status 200 | `[REDIRECT]` |
-| `test_tls_verify_on` | HTTPS with CA bundle validation (needs internet) | `[TLS VERIFY ON]` |
-| `test_tls_verify_off` | HTTPS without CA validation | `[TLS VERIFY OFF]` |
-| `test_on_error_4xx` | 404 routes to on_error, not on_response | `[4XX ON_ERROR]` |
-| `test_concurrent_requests` | Two requests in flight simultaneously; both complete | `[CONCURRENT]` |
+Tests start automatically ~1 minute after boot (gives WiFi and the API time to
+stabilise), then repeat every 10 minutes.
 
-The `test_truncation` test also validates the "break early" fix — if the worker
-is blocked reading the full 4096-byte response for the 10 s timeout, something
-regressed. The response should complete well under 1 s.
+**Note:** the ESP32 must be able to reach the test server host on port 8765.
+If it is on an isolated IoT VLAN, open TCP 8765 from that subnet both at the
+router/firewall and on the host OS.
+
+### What runs
+
+All 12 tests execute sequentially. Look for `[PASS]` / `[FAIL]` per test,
+and `=== RESULTS: N passed, M failed ===` at the end.
+
+| Test | Endpoint | What it verifies |
+|------|----------|-----------------|
+| 1/12 | `GET /slow?delay=2` | GET completes; `duration_ms ≥ 2000` |
+| 2/12 | `POST /echo` | POST body echoed back by server |
+| 3/12 | `GET /bytes?size=4096` (max=64 B) | Body capped at 64; `content_length` = 4096 |
+| 4/12 | `GET /stream?lines=5` | Chunked: `content_length == body.size()` (not 0) |
+| 5/12 | `GET /fast` | `x-server` header collected; un-requested header absent |
+| 6/12 | `GET /headers` | Custom request header echoed by server |
+| 7/12 | `DELETE /delete` | DELETE returns 200 |
+| 8/12 | `PATCH /patch` | PATCH body echoed; status 200 |
+| 9/12 | `GET /redirect?n=3` | 3 redirects followed; final status 200 |
+| 10/12 | `GET /fast` × 2 | Sequential requests: second fires only after first `on_complete` |
+| 11/12 | `GET /status?code=404` | 404 routes to `on_error`, not `on_response` |
+| 12/12 | `GET /status?code=500` | 500 routes to `on_error`, not `on_response` |
 
 ---
 

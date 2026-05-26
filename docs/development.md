@@ -40,10 +40,15 @@ components/http_request_async/
   http_request_async_idf.cpp  IDF worker task + esp_http_client calls
 
 tests/
-  python/test_init.py       Pytest: schema validation, defaults, constraints
-  native/main.cpp           GoogleTest: C++ business logic (no hardware needed)
-  esphome/test_config.yaml  ESPHome compile target (Tier 3)
-  esphome/device_test.yaml  Hardware flash config (Tier 4)
+  python/test_init.py         Pytest: schema validation, defaults, constraints
+  native/main.cpp             GoogleTest: C++ business logic (no hardware needed)
+  native/idf_http_mock.h      Mock state struct for esp_http_client_* calls
+  native/idf_http_mock.cpp    Mock implementations; compiled with real IDF source
+  esphome/test_config.yaml    ESPHome compile target (Tier 3)
+  esphome/hardware_test.yaml  Self-running hardware test suite (Tier 4)
+
+tools/
+  test_server.py              Lightweight HTTP server for Tier 4 tests
 
 docs/
   development.md            ← you are here
@@ -96,6 +101,7 @@ make test           # full suite before commit
 | `__init__.py` — any action schema key | A `TestGetActionSchema` / `TestPostActionSchema` test |
 | `http_request_async.h` — `enqueue_request()` | A test for the changed behaviour |
 | `http_request_async.h` — `play_complex()` alive-flag | `AliveGuardPreventsStaleCallbacks` updated |
+| `http_request_async_idf.cpp` — `execute_request_()` | An `Idf*` test in `tests/native/main.cpp` |
 
 ---
 
@@ -107,6 +113,8 @@ make test              C++ unit tests + Python schema tests
 make test-native       C++ unit tests only (no ESPHome needed)
 make test-python       Python schema tests only
 make compile           full ESPHome codegen + C++ compile (~3 min)
+make flash             compile + OTA flash hardware test suite + tail logs
+make logs              tail logs from the running device (no reflash)
 make rebuild           clean then test
 make upgrade           pip upgrade to latest ESPHome (run after monthly release)
 make check-deps        verify cmake, g++, python3, .venv are all present

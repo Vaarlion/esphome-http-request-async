@@ -1,20 +1,18 @@
 # ── http_request_async – development Makefile ─────────────────────────────────
 #
-# Single entry point for all development operations. Agents and humans use the
-# same targets so there's no ambiguity about how to run things.
+# Single entry point for all development operations.
 #
 # Usage:
 #   make              → show this help
 #   make init         → create .venv and install Python dev dependencies
 #   make test         → run all tests (C++ + Python)
 #   make test-native  → C++ unit tests only (fastest, no ESPHome needed)
-#   make test-python  → Python schema tests only  (runs make init if needed)
-#   make compile      → esphome compile (full codegen + C++ compile, no flash)
-#   make flash        → compile + OTA flash + tail logs  (needs secrets.yaml)
-#   make compile-device → compile device_test.yaml only  (needs secrets.yaml)
-#   make logs         → tail device logs without flashing
+#   make test-python  → Python schema tests only
+#   make compile      → ESPHome compile check (codegen + C++, no flash)
+#   make flash        → compile + OTA flash + tail logs  [DEVICE=ip optional]
+#   make logs         → tail device logs without flashing  [DEVICE=ip optional]
 #   make clean        → remove build artefacts (keeps .venv)
-#   make clean-venv   → remove .venv  (forces a fresh pip install on next init)
+#   make clean-venv   → remove .venv
 #   make rebuild      → clean + test
 
 .DEFAULT_GOAL := help
@@ -26,9 +24,10 @@ NATIVE_CMAKE   := tests/native
 ESPHOME_CONFIG := tests/esphome/test_config.yaml
 PYTHON_TESTS   := tests/python/
 
-# Device test (Tier 4 — hardware, requires secrets.yaml)
-DEVICE_CONFIG  := tests/esphome/device_test.yaml
+# Hardware test — compile-check + flash target
+HW_TEST_CONFIG := tests/esphome/hardware_test.yaml
 DEVICE_SECRETS := tests/esphome/secrets.yaml
+
 # Optional: override target device  e.g.  make flash DEVICE=192.168.1.42
 DEVICE      ?=
 DEVICE_FLAG := $(if $(DEVICE),--device $(DEVICE),)
@@ -37,15 +36,10 @@ DEVICE_FLAG := $(if $(DEVICE),--device $(DEVICE),)
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
 # ── Virtual environment ────────────────────────────────────────────────────────
-# .venv is created by `make init`.  All Python targets depend on the sentinel
-# file so they auto-initialise on first use.  The venv is intentionally NOT
-# removed by `make clean` — use `make clean-venv` for that.
-
 VENV          := .venv
 VENV_SENTINEL := $(VENV)/.installed
 PYTEST        := $(VENV)/bin/pytest
 PYTHON        := $(VENV)/bin/python3
-# The venv's esphome binary is used for `make compile` when the venv exists.
 ESPHOME       := $(shell test -f $(VENV)/bin/esphome && echo $(VENV)/bin/esphome || echo esphome)
 
 # ── Colours (suppressed when not a terminal) ───────────────────────────────────
@@ -68,7 +62,6 @@ endif
 .PHONY: init
 init: $(VENV_SENTINEL)  ## Create .venv and install Python dev dependencies (idempotent)
 
-# Re-runs if requirements_test.txt changes.
 $(VENV_SENTINEL): requirements_test.txt
 	@echo "$(BOLD)Setting up Python virtual environment…$(RESET)"
 	python3 -m venv $(VENV)
@@ -102,50 +95,47 @@ compile: $(VENV_SENTINEL)  ## ESPHome compile check — codegen + C++ compile, n
 	  echo "$(GREEN)Compilation: PASSED$(RESET)" || \
 	  (echo "$(RED)Compilation: FAILED$(RESET)"; exit 1)
 
-# ── Device targets (Tier 4 — hardware) ───────────────────────────────────────
+# ── Hardware test targets ─────────────────────────────────────────────────────
 #
-# Require tests/esphome/secrets.yaml (gitignored).
-# Copy tests/esphome/secrets.yaml.example → tests/esphome/secrets.yaml and fill in.
+# tests/esphome/hardware_test.yaml is a self-running test suite.
+# All 12 tests fire automatically on boot — no HA or dashboard required.
+#
+# Setup:
+#   1. python3 tools/test_server.py        (on your dev machine, port 8765)
+#   2. cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml
+#      Fill in wifi_ssid, wifi_password, api_key, ota_password, test_server.
 
 .PHONY: _check-secrets
 _check-secrets:
 	@test -f $(DEVICE_SECRETS) || ( \
 	  echo "$(RED)Missing: $(DEVICE_SECRETS)$(RESET)"; \
 	  echo "  cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml"; \
-	  echo "  # then fill in wifi_ssid, api_key, ota_password, test_server"; \
+	  echo "  # fill in wifi_ssid, wifi_password, api_key, ota_password"; \
 	  exit 1 )
 
 .PHONY: flash
 flash: $(VENV_SENTINEL) _check-secrets  ## Compile + OTA flash + tail logs  [DEVICE=ip optional]
-	@$(ESPHOME) run $(DEVICE_CONFIG) $(DEVICE_FLAG)
-
-.PHONY: compile-device
-compile-device: $(VENV_SENTINEL) _check-secrets  ## Compile device_test.yaml only (local component, no flash)
-	@echo "$(BOLD)── Device test compilation ──$(RESET)"
-	@$(ESPHOME) compile $(DEVICE_CONFIG) && \
-	  echo "$(GREEN)Device compilation: PASSED$(RESET)" || \
-	  (echo "$(RED)Device compilation: FAILED$(RESET)"; exit 1)
+	@$(ESPHOME) run $(HW_TEST_CONFIG) $(DEVICE_FLAG)
 
 .PHONY: logs
 logs: $(VENV_SENTINEL)  ## Tail device logs without flashing  [DEVICE=ip optional]
-	@$(ESPHOME) logs $(DEVICE_CONFIG) $(DEVICE_FLAG)
+	@$(ESPHOME) logs $(HW_TEST_CONFIG) $(DEVICE_FLAG)
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 .PHONY: build-native
 build-native: $(NATIVE_RUNNER)  ## Build C++ tests without running them
 
-# Configure if the build directory doesn't contain a cache yet
 $(NATIVE_BUILD)/CMakeCache.txt:
 	@echo "$(BOLD)Configuring native tests…$(RESET)"
 	@cmake -B $(NATIVE_BUILD) $(NATIVE_CMAKE) \
 	    -DCMAKE_BUILD_TYPE=Debug 2>&1 | grep -v "^--" || true
 
-# Build: depends on configuration and all source files
 $(NATIVE_RUNNER): $(NATIVE_BUILD)/CMakeCache.txt \
                   $(NATIVE_CMAKE)/main.cpp \
-                  $(NATIVE_CMAKE)/component_stubs.cpp \
-                  components/http_request_async/http_request_async.h
+                  $(NATIVE_CMAKE)/idf_http_mock.cpp \
+                  components/http_request_async/http_request_async.h \
+                  components/http_request_async/http_request_async_idf.cpp
 	@echo "$(BOLD)Building native tests ($(NPROC) jobs)…$(RESET)"
 	@cmake --build $(NATIVE_BUILD) -j$(NPROC) 2>&1 | grep -E "error:|warning:|Linking|Built" || true
 
@@ -206,7 +196,8 @@ help:  ## Show this help
 	@echo "  make compile       full ESPHome compilation check (~3 min)"
 	@echo ""
 	@echo "$(BOLD)Hardware testing (Tier 4):$(RESET)"
+	@echo "  python3 tools/test_server.py   (on your dev machine)"
 	@echo "  cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml"
-	@echo "  # fill in wifi_ssid, api_key, ota_password, test_server"
+	@echo "  # fill in wifi credentials + test_server (LAN IP:8765)"
 	@echo "  make flash         compile + OTA flash + tail logs"
-	@echo "  make logs          tail logs without flashing"
+	@echo "  make logs          tail logs from the running device"

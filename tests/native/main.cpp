@@ -25,6 +25,9 @@
 // Bring in the component under test (header-only portion + implementation shim)
 #include "../../components/http_request_async/http_request_async.h"
 
+// IDF mock state — controls esp_http_client_* calls made by execute_request_().
+#include "idf_http_mock.h"
+
 #include <gtest/gtest.h>
 
 using namespace esphome::http_request_async;
@@ -717,6 +720,262 @@ TEST(HttpRequestAsync, StopClearsIsRunningAndSuppressesCallbacks) {
   comp.pump_responses();
 
   EXPECT_FALSE(action.is_running());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IDF-level redirect tests
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// These tests use the REAL execute_request_() from http_request_async_idf.cpp.
+// All esp_http_client_* calls go through idf_http_mock.cpp whose behaviour is
+// controlled via g_idf_mock.  This catches regressions in the redirect-following
+// loop that the higher-level mock tests (MockHttpRequestAsyncComponent) cannot —
+// because that mock bypasses execute_request_() entirely.
+//
+// Hardware test 9/12 in hardware_test.yaml remains the authoritative test for
+// a real network + real IDF client; these tests cover the logic layer only.
+
+/// Test component that uses the real execute_request_() from the IDF file.
+/// Queues are created directly in the constructor, bypassing setup() which would
+/// try to start FreeRTOS worker tasks.
+class IdfMockHttpRequestAsyncComponent : public HttpRequestAsyncComponent {
+ public:
+  IdfMockHttpRequestAsyncComponent() {
+    this->request_queue_ = xQueueCreate(8, sizeof(PendingRequest *));
+    this->response_queue_ = xQueueCreate(8, sizeof(PendingRequest *));
+    // Apply defaults that match a typical YAML configuration.
+    this->set_follow_redirects(true);
+    this->set_redirect_limit(3);
+    this->set_useragent("ESPHome");
+    this->set_timeout(4500);
+    this->set_buffer_size_rx(512);
+    this->set_buffer_size_tx(512);
+  }
+
+  void pump_worker() {
+    PendingRequest *req = nullptr;
+    while (xQueueReceive(this->request_queue_, &req, 0) == pdTRUE) {
+      this->execute_request_(req);
+    }
+  }
+
+  void pump_responses() { this->loop(); }
+  void tick() { pump_worker(); pump_responses(); }
+};
+
+// ── 302×3 chain resolves to the final 200 ────────────────────────────────────
+//
+// Mirrors hardware test 9/12 (/redirect?n=3 → /fast).
+// Verifies that three redirect hops are followed and on_response fires with
+// the final status code, not the intermediate 302.
+
+TEST(HttpRequestAsync, IdfRedirectChainFollowed) {
+  g_idf_mock.reset();
+  g_idf_mock.push_statuses({302, 302, 302, 200});
+
+  IdfMockHttpRequestAsyncComponent comp;
+  comp.set_redirect_limit(5);
+
+  bool response_called = false;
+  bool error_called    = false;
+  int  final_status    = -1;
+
+  auto *req = make_request("http://example.com/redirect?n=3");
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    response_called = true;
+    final_status    = c->status_code;
+  };
+  req->on_error_cb = [&]() { error_called = true; };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_TRUE(response_called);
+  EXPECT_FALSE(error_called);
+  EXPECT_EQ(final_status, 200);
+  // Each redirect hop calls set_redirection() once.
+  EXPECT_EQ(g_idf_mock.set_redirection_call_count, 3);
+  // 3 redirect hops + 1 final response = 4 open() calls.
+  EXPECT_EQ(g_idf_mock.open_call_count, 4);
+  // close() inside each redirect branch (3×) + close() at end of function (1×).
+  EXPECT_EQ(g_idf_mock.close_call_count, 4);
+}
+
+// ── Redirect limit is enforced ────────────────────────────────────────────────
+//
+// With redirect_limit = 3 and 5 consecutive 302 responses, the component must
+// stop after 3 hops and surface the 4th 302 as the final response (on_response,
+// not on_error).
+
+TEST(HttpRequestAsync, IdfRedirectLimitEnforced) {
+  g_idf_mock.reset();
+  // Five 302s: the component follows 3, then stops at the 4th.
+  g_idf_mock.push_statuses({302, 302, 302, 302, 302});
+
+  IdfMockHttpRequestAsyncComponent comp;  // redirect_limit defaults to 3
+
+  bool response_called = false;
+  bool error_called    = false;
+  int  final_status    = -1;
+
+  auto *req = make_request();
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    response_called = true;
+    final_status    = c->status_code;
+  };
+  req->on_error_cb = [&]() { error_called = true; };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  // 3xx is still a "success" (on_response, not on_error) even when the limit
+  // is reached — the caller's YAML can inspect status_code if needed.
+  EXPECT_TRUE(response_called);
+  EXPECT_FALSE(error_called);
+  EXPECT_EQ(final_status, 302);
+  EXPECT_EQ(g_idf_mock.set_redirection_call_count, 3);
+}
+
+// ── Redirect is not followed when follow_redirects: false ────────────────────
+
+TEST(HttpRequestAsync, IdfRedirectNotFollowedWhenDisabled) {
+  g_idf_mock.reset();
+  g_idf_mock.push_statuses({302});
+
+  IdfMockHttpRequestAsyncComponent comp;
+  comp.set_follow_redirects(false);
+
+  int final_status = -1;
+  auto *req = make_request();
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    final_status = c->status_code;
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(final_status, 302);
+  EXPECT_EQ(g_idf_mock.set_redirection_call_count, 0);
+  EXPECT_EQ(g_idf_mock.open_call_count, 1);
+}
+
+// ── Redirect stops when the Location header is absent ────────────────────────
+//
+// esp_http_client_set_redirection() returns ESP_FAIL when there is no Location
+// header.  The component must treat the redirect response as final.
+
+TEST(HttpRequestAsync, IdfRedirectStopsOnMissingLocation) {
+  g_idf_mock.reset();
+  g_idf_mock.push_statuses({302});
+  g_idf_mock.redirection_has_location = false;
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  int final_status = -1;
+  auto *req = make_request();
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    final_status = c->status_code;
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(final_status, 302);
+  // set_redirection() was called (we tried), but it failed → stopped.
+  EXPECT_EQ(g_idf_mock.set_redirection_call_count, 1);
+  // Only one open() (the original request); no successful redirect to re-open.
+  EXPECT_EQ(g_idf_mock.open_call_count, 1);
+}
+
+// ── 302 switches method to GET and drops the request body ────────────────────
+//
+// Per RFC 9110 §15.4.3, a 302 redirect from POST should be re-sent as GET
+// with no body.  esp_http_client_set_redirection() handles the method switch;
+// the component must zero the body length for the follow-up open() call.
+
+TEST(HttpRequestAsync, IdfRedirect302SwitchesToGetDropsBody) {
+  g_idf_mock.reset();
+  g_idf_mock.push_statuses({302, 200});
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  int final_status = -1;
+  auto *req = make_request("http://example.com/submit", "POST");
+  req->body = "key=value";  // 9 bytes
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    final_status = c->status_code;
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(final_status, 200);
+  // The first open() carries the POST body (9 bytes); the second carries nothing.
+  EXPECT_EQ(g_idf_mock.open_call_count, 2);
+  EXPECT_EQ(g_idf_mock.last_open_write_len, 0);
+  // set_method() is NOT called for 302 — set_redirection() already switches to
+  // GET internally in IDF.  The component only restores the method for 307/308.
+  EXPECT_EQ(g_idf_mock.set_method_call_count, 0);
+}
+
+// ── 307 preserves the original method and body ───────────────────────────────
+//
+// Per RFC 9110 §15.4.8, a 307 redirect must not change the request method.
+// The component must call esp_http_client_set_method() to restore the method
+// after set_redirection() internally switches to GET.
+
+TEST(HttpRequestAsync, IdfRedirect307PreservesMethod) {
+  g_idf_mock.reset();
+  g_idf_mock.push_statuses({307, 200});
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  int final_status = -1;
+  auto *req = make_request("http://example.com/submit", "POST");
+  req->body = "key=value";  // 9 bytes
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    final_status = c->status_code;
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(final_status, 200);
+  EXPECT_EQ(g_idf_mock.open_call_count, 2);
+  // Body is preserved on the second hop: write_len == 9.
+  EXPECT_EQ(g_idf_mock.last_open_write_len, 9);
+  // set_method() must be called once to restore POST (set_redirection switches to GET).
+  EXPECT_EQ(g_idf_mock.set_method_call_count, 1);
+  EXPECT_EQ(g_idf_mock.last_set_method, HTTP_METHOD_POST);
+}
+
+// ── Headers from redirect hops are cleared; only final-response headers survive ─
+//
+// The component calls container->response_headers_.clear() before following each
+// redirect.  Headers fired during intermediate hops must not bleed into the
+// on_response callback.
+
+TEST(HttpRequestAsync, IdfRedirectClearsIntermediateHeaders) {
+  g_idf_mock.reset();
+  g_idf_mock.push_statuses({302, 200});
+  // The mock fires these headers on every fetch_headers() call (both the 302 hop
+  // and the 200 hop).  The component clears them between hops, so the final
+  // on_response should still see them — collected fresh from the 200 response.
+  g_idf_mock.response_headers = {{"x-final-server", "prod"}};
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  std::string captured_header;
+  auto *req = make_request();
+  req->lower_case_collect_headers = {"x-final-server"};
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    captured_header = c->get_response_header("x-final-server");
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_EQ(captured_header, "prod");
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
