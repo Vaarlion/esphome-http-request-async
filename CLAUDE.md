@@ -76,16 +76,23 @@ http_request_async/
 │   ├── native/
 │   │   ├── CMakeLists.txt          ← GoogleTest build
 │   │   ├── main.cpp                ← C++ unit tests
-│   │   ├── component_stubs.cpp     ← native implementations (no IDF deps)
+│   │   ├── idf_http_mock.h         ← controllable mock state for esp_http_client_*
+│   │   ├── idf_http_mock.cpp       ← mock implementations; compiled with real IDF source
 │   │   └── mocks/
 │   │       ├── esphome_compat.h    ← all ESPHome + FreeRTOS shims
+│   │       ├── esp_http_client.h   ← IDF types + function declarations
+│   │       ├── esp_timer.h         ← stub (function defined in esphome_compat.h)
 │   │       ├── freertos/*.h        ← empty stubs (types in esphome_compat.h)
 │   │       └── esphome/**/*.h      ← empty stubs (types in esphome_compat.h)
 │   └── esphome/
-│       └── test_config.yaml        ← esphome compile target
+│       ├── test_config.yaml        ← Tier 3: ESPHome compile check (no secrets, no flash)
+│       ├── hardware_test.yaml      ← Tier 4: self-running hardware test suite (12 tests)
+│       ├── secrets.yaml            ← gitignored; copy from secrets.yaml.example
+│       └── secrets.yaml.example   ← template (wifi, api, ota)
 │
 └── example/
-    └── shelly_dimmer.yaml          ← real-world usage example
+    ├── shelly_dimmer.yaml          ← real-world usage example
+    └── ble_proxy_http_test.yaml    ← BLE proxy + HTTP integration example
 ```
 
 ---
@@ -103,6 +110,8 @@ make test              # run C++ unit tests + Python schema tests
 make test-native       # C++ tests only (no esphome/python/venv needed)
 make test-python       # Python tests only — auto-runs `make init` if venv missing
 make compile           # full esphome compile check (2-5 min, no hardware)
+make flash             # compile + OTA flash hardware test suite + tail logs
+make logs              # tail logs from the running device (no reflash)
 make clean             # remove build artefacts (keeps .venv)
 make clean-venv        # remove .venv (run before make init to force a fresh install)
 make rebuild           # clean + test
@@ -146,23 +155,28 @@ The `upgrade` target is the only thing that needs to run. If `make test` and
 
 ---
 
-## Three-tier testing strategy
+## Four-tier testing strategy
 
 **Tier 1 — Python pytest** (`make test-python`): Tests `__init__.py` schema
 validation, defaults, and constraint enforcement. Runs in seconds, no hardware,
 no cmake. Follows the same pattern as ESPHome's own unit tests.
 
 **Tier 2 — Native C++ tests** (`make test-native`): Tests business logic in
-isolation — callback ordering, alive-flag, queue management, error paths.
-FreeRTOS and ESP-IDF are replaced by shims in `tests/native/mocks/`.
+isolation — callback ordering, alive-flag, queue management, error paths, and the
+redirect-following loop. The real `http_request_async_idf.cpp` is compiled into
+the test build; all `esp_http_client_*` calls are intercepted by
+`idf_http_mock.cpp` whose return values are controlled per-test.
 Runs in seconds, no hardware, no ESPHome install needed.
 
 **Tier 3 — ESPHome compile** (`make compile`): Validates that the Python
 codegen and generated C++ both compile. Catches type mismatches and missing
 imports that can't be caught locally. Requires ESPHome installed.
 
-Hardware testing (Tier 4) is done by flashing `tests/esphome/test_config.yaml`
-against a local `httpbin` instance.
+**Tier 4 — Hardware** (`make flash`): Self-running test suite in
+`tests/esphome/hardware_test.yaml`. Flash to an ESP32, watch the logs — all
+12 tests start automatically ~1 min after boot. No HA, no dashboard required.
+Run before tagging a release. Requires `python3 tools/test_server.py` running
+on the dev machine and reachable from the ESP32's network segment.
 
 ---
 
@@ -283,6 +297,7 @@ ESPHome's codebase eventually):
 |---|---|
 | `http_request_async.h` — `enqueue_request()` | Test for the changed behavior |
 | `http_request_async.h` — `play_complex()` alive-flag logic | `AliveGuardPreventsStaleCallbacks` test updated |
+| `http_request_async_idf.cpp` — `execute_request_()` | An `Idf*` test in `main.cpp` |
 | `__init__.py` — any `CONFIG_SCHEMA` key | A corresponding `TestHubSchema` test |
 | `__init__.py` — any action schema key | A corresponding `TestGetActionSchema` etc. test |
 
