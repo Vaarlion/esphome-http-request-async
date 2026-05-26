@@ -218,8 +218,10 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
   cfg.url = req->url.c_str();
   cfg.method = idf_method;
   cfg.timeout_ms = static_cast<int>(this->timeout_ms_);
-  cfg.disable_auto_redirect = !this->follow_redirects_;
-  cfg.max_redirection_count = this->redirect_limit_;
+  // Redirects are handled manually in the loop below — the streaming API
+  // (open/fetch_headers/read) does NOT auto-follow redirects regardless of
+  // disable_auto_redirect; that flag only affects esp_http_client_perform().
+  cfg.disable_auto_redirect = true;
   cfg.user_agent = this->useragent_.c_str();
   cfg.buffer_size = this->buffer_size_rx_;
   cfg.buffer_size_tx = this->buffer_size_tx_;
@@ -261,67 +263,128 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
     esp_http_client_set_header(client, hdr.name.c_str(), hdr.value.c_str());
   }
 
-  // ── Open and write body ────────────────────────────────────────────────
-  const int body_len = static_cast<int>(req->body.size());
-  esp_err_t err = esp_http_client_open(client, body_len);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_http_client_open() failed: %s", esp_err_to_name(err));
-    esp_http_client_cleanup(client);
-    container->success = false;
-    container->duration_ms =
-        static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
-    xQueueSend(this->response_queue_, &req, portMAX_DELAY);
-    return;
-  }
+  // ── Request + redirect-following loop ─────────────────────────────────
+  // esp_http_client_open() / fetch_headers() / read() never auto-follow
+  // redirects — that only works with esp_http_client_perform(). We drive
+  // the redirect chain here so we can keep the streaming read API for the
+  // final response body.
+  //
+  // Per RFC 9110 §15.4:
+  //   301 / 302 / 303 → switch to GET, discard body
+  //   307 / 308       → preserve method and body
+  //
+  // esp_http_client_set_redirection() reads the Location header, updates the
+  // client URL (handling relative URLs correctly), and switches the method to
+  // GET. For 307/308 we restore the current method afterwards.
+  esp_err_t err = ESP_OK;
+  int64_t hdr_len = -1;
+  int redirect_count = 0;
+  int current_body_len = static_cast<int>(req->body.size());
+  esp_http_client_method_t current_method = idf_method;
 
-  if (body_len > 0) {
-    int remaining = body_len;
-    int offset = 0;
-    while (remaining > 0) {
-      const int written =
-          esp_http_client_write(client, req->body.c_str() + offset, remaining);
-      if (written < 0) {
-        err = ESP_FAIL;
+  while (true) {
+    err = esp_http_client_open(client, current_body_len);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_http_client_open() failed: %s", esp_err_to_name(err));
+      esp_http_client_cleanup(client);
+      container->success = false;
+      container->duration_ms =
+          static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
+      xQueueSend(this->response_queue_, &req, portMAX_DELAY);
+      return;
+    }
+
+    if (current_body_len > 0) {
+      int remaining = current_body_len;
+      int offset = 0;
+      while (remaining > 0) {
+        const int written =
+            esp_http_client_write(client, req->body.c_str() + offset, remaining);
+        if (written < 0) {
+          err = ESP_FAIL;
+          break;
+        }
+        offset += written;
+        remaining -= written;
+      }
+    }
+
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to write request body: %s", esp_err_to_name(err));
+      esp_http_client_close(client);
+      esp_http_client_cleanup(client);
+      container->success = false;
+      container->duration_ms =
+          static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
+      xQueueSend(this->response_queue_, &req, portMAX_DELAY);
+      return;
+    }
+
+    hdr_len = esp_http_client_fetch_headers(client);
+    container->status_code = esp_http_client_get_status_code(client);
+
+    // status_code <= 0 means we never received an HTTP response:
+    // the socket timed out, DNS failed, TLS handshake failed, connection was
+    // reset, or the server hung up. hdr_len can be -1 for both "chunked
+    // response" (success) and "transport error", so status_code is the
+    // reliable discriminator.
+    if (container->status_code <= 0) {
+      ESP_LOGW(TAG, "HTTP transport error (status=%d) for %s",
+               container->status_code, req->url.c_str());
+      esp_http_client_close(client);
+      esp_http_client_cleanup(client);
+      container->success = false;
+      container->duration_ms =
+          static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
+      if (xQueueSend(this->response_queue_, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "Response queue full — request to %s leaked", req->url.c_str());
+        delete req;  // NOLINT
+      }
+      return;
+    }
+
+    // Follow redirect?
+    if (this->follow_redirects_ &&
+        container->status_code >= 300 && container->status_code < 400 &&
+        redirect_count < static_cast<int>(this->redirect_limit_)) {
+      // Only expose headers from the final response to on_response callbacks.
+      container->response_headers_.clear();
+
+      const esp_err_t redir_err = esp_http_client_set_redirection(client);
+
+      if (container->status_code == 307 || container->status_code == 308) {
+        // set_redirection() always switches to GET; restore the method that
+        // was in use for this leg so method+body are preserved per RFC 9110.
+        esp_http_client_set_method(client, current_method);
+      } else {
+        // 301 / 302 / 303: accept the GET switch, discard the body.
+        current_method = HTTP_METHOD_GET;
+        current_body_len = 0;
+      }
+
+      esp_http_client_close(client);
+      redirect_count++;
+
+      if (redir_err != ESP_OK) {
+        // No Location header (or malformed) — treat this response as final.
+        ESP_LOGW(TAG, "Redirect hop %d: no Location header in %d response — stopping",
+                 redirect_count, container->status_code);
         break;
       }
-      offset += written;
-      remaining -= written;
+
+      ESP_LOGD(TAG, "Redirect hop %d/%u (status=%d) → following Location",
+               redirect_count, this->redirect_limit_, container->status_code);
+      continue;
     }
-  }
 
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to write request body: %s", esp_err_to_name(err));
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    container->success = false;
-    container->duration_ms =
-        static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
-    xQueueSend(this->response_queue_, &req, portMAX_DELAY);
-    return;
-  }
-
-  // ── Fetch response headers ─────────────────────────────────────────────
-  const int64_t hdr_len = esp_http_client_fetch_headers(client);
-  container->status_code = esp_http_client_get_status_code(client);
-
-  // status_code <= 0 means we never received an HTTP response:
-  // the socket timed out, DNS failed, TLS handshake failed, connection was reset,
-  // or the server hung up. hdr_len can be -1 for both "chunked response" (success)
-  // and "transport error", so status_code is the reliable discriminator.
-  if (container->status_code <= 0) {
-    ESP_LOGW(TAG, "HTTP transport error (status=%d) for %s",
-             container->status_code, req->url.c_str());
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    container->success = false;
-    container->duration_ms =
-        static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
-    if (xQueueSend(this->response_queue_, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-      ESP_LOGE(TAG, "Response queue full — request to %s leaked", req->url.c_str());
-      delete req;  // NOLINT
+    if (this->follow_redirects_ &&
+        container->status_code >= 300 && container->status_code < 400) {
+      ESP_LOGW(TAG, "Redirect limit (%u) reached for %s — returning %d",
+               this->redirect_limit_, req->url.c_str(), container->status_code);
     }
-    return;
+    break;
   }
+
   // hdr_len is -1 for chunked responses (no Content-Length), >= 0 for known sizes.
   container->content_length = hdr_len >= 0 ? static_cast<size_t>(hdr_len) : 0;
 
