@@ -37,12 +37,20 @@ struct IdfHttpMockState {
   bool redirection_has_location{true}; ///< false → set_redirection() returns ESP_FAIL.
   bool open_fails{false};              ///< true  → open() returns ESP_FAIL.
 
+  // ── Write control ─────────────────────────────────────────────────────────
+  /// Controls what esp_http_client_write() returns:
+  ///   0 = normal (returns len — all bytes written)
+  ///   1 = stall   (returns 0 — the partial-write / non-blocking retry signal)
+  ///   2 = error   (returns -1)
+  int write_failure_mode{0};
+
   // ── Call tracking ─────────────────────────────────────────────────────────
   int  open_call_count{0};
   int  close_call_count{0};
   int  fetch_headers_call_count{0};
   int  set_redirection_call_count{0};
   int  set_method_call_count{0};
+  int  write_call_count{0};
   esp_http_client_method_t last_set_method{HTTP_METHOD_GET};
   int  last_open_write_len{0}; ///< write_len arg passed to the most recent open().
 
@@ -56,11 +64,13 @@ struct IdfHttpMockState {
     response_headers.clear();
     redirection_has_location = true;
     open_fails = false;
+    write_failure_mode = 0;
     open_call_count = 0;
     close_call_count = 0;
     fetch_headers_call_count = 0;
     set_redirection_call_count = 0;
     set_method_call_count = 0;
+    write_call_count = 0;
     last_set_method = HTTP_METHOD_GET;
     last_open_write_len = 0;
   }
