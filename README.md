@@ -1,3 +1,27 @@
+> [!WARNING]
+> **This project was written entirely by AI (Claude), prompted by a non-developer.**
+>
+> It exists as a functional workaround for a personal project. It is not a proper ESPHome
+> implementation and should not be treated as one. The component fills a genuine,
+> long-standing gap in ESPHome:
+>
+> - **[feature-requests#799](https://github.com/esphome/feature-requests/issues/799)** —
+>   "Non-blocking http requests" — open since July 2020, no milestone, no assignee.
+> - **[PR#7892](https://github.com/esphome/esphome/pull/7892)** —
+>   "[http_request] don't block loop with actions" — the only serious upstream attempt,
+>   closed stale in February 2026.
+>
+> If you are a real ESPHome developer reading this: **please do this properly.** The problem
+> is real, documented, and affects anyone using `http_request` with automations.
+>
+> The code here was written as carefully as an AI conversation allows — with tests,
+> documented design decisions, and a sensible architecture. It runs in production on real
+> hardware. But it was not written by someone who knows the ESPHome internals, and it has
+> not been reviewed by anyone who does. Use it at your own risk, and treat it as a reference
+> for what a proper implementation might look like — not as the implementation itself.
+
+---
+
 # ESPHome HTTP Request Async
 
 Non-blocking HTTP requests for **ESP32 + ESP-IDF**. The ESPHome main loop never pauses.
