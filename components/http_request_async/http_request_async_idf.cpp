@@ -300,7 +300,11 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
       while (remaining > 0) {
         const int written =
             esp_http_client_write(client, req->body.c_str() + offset, remaining);
-        if (written < 0) {
+        // written == 0 is treated as an error: the IDF HTTP client is blocking,
+        // so returning 0 bytes written with remaining > 0 is a stall condition
+        // (closed connection, internal error, etc.). Looping on 0 would hang
+        // forever — bail out the same way we do for negative return values.
+        if (written <= 0) {
           err = ESP_FAIL;
           break;
         }

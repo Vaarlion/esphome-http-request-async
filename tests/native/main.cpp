@@ -1031,6 +1031,73 @@ TEST(HttpRequestAsync, IdfResponseQueueFullDoesNotStallAutomation) {
   EXPECT_EQ(complete_count, QUEUE_CAP + 1);
 }
 
+// ── Write loop: zero-return stall fires on_error ──────────────────────────────
+//
+// Regression test for: if esp_http_client_write() returns 0 (no bytes written,
+// no error), the write loop was `while (remaining > 0)` with `if (written < 0)
+// break` — a 0 return never advanced the offset and never broke out, hanging
+// forever.
+//
+// Fix: treat written <= 0 as an error (ESP_FAIL).  On the blocking IDF HTTP
+// client, returning 0 with remaining > 0 is a stall/closed-connection condition
+// and should never be retried.
+//
+// The test itself would hang (timeout) with the old code, so its completion is
+// also an implicit assertion.
+
+TEST(HttpRequestAsync, IdfWriteZeroReturnTriggersOnError) {
+  g_idf_mock.reset();
+  g_idf_mock.write_failure_mode = 1;  // write() returns 0 — the stall signal
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  bool error_called    = false;
+  bool response_called = false;
+
+  auto *req = make_request("http://example.com/submit", "POST");
+  req->body = "key=value";  // non-empty body: write loop is entered
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer>) { response_called = true; };
+  req->on_error_cb    = [&]() { error_called = true; };
+
+  comp.enqueue_request(req);
+  comp.tick();  // hangs forever on unfixed code; completes in O(1) with the fix
+
+  EXPECT_TRUE(error_called);
+  EXPECT_FALSE(response_called);
+  // write() must be called exactly once: the loop exits immediately on the
+  // first 0 return instead of spinning endlessly.
+  EXPECT_EQ(g_idf_mock.write_call_count, 1);
+}
+
+// ── Write loop: negative return also fires on_error ───────────────────────────
+//
+// Belt-and-suspenders: the existing negative-return path has always worked
+// (written < 0 was already an error), but there was no dedicated test for it.
+// This pins the behaviour explicitly so any refactor of the write loop will
+// catch a regression here before it reaches hardware.
+
+TEST(HttpRequestAsync, IdfWriteNegativeReturnTriggersOnError) {
+  g_idf_mock.reset();
+  g_idf_mock.write_failure_mode = 2;  // write() returns -1 — hard error
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  bool error_called    = false;
+  bool response_called = false;
+
+  auto *req = make_request("http://example.com/submit", "POST");
+  req->body = "key=value";
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer>) { response_called = true; };
+  req->on_error_cb    = [&]() { error_called = true; };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  EXPECT_TRUE(error_called);
+  EXPECT_FALSE(response_called);
+  EXPECT_EQ(g_idf_mock.write_call_count, 1);
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {

@@ -56,7 +56,10 @@ int esp_http_client_open(esp_http_client_handle_t /*client*/, int write_len) {
 }
 
 int esp_http_client_write(esp_http_client_handle_t /*client*/, const char * /*buf*/, int len) {
-  return len;  // claim all bytes written
+  g_idf_mock.write_call_count++;
+  if (g_idf_mock.write_failure_mode == 1) return 0;   // stall: no bytes written, no error
+  if (g_idf_mock.write_failure_mode == 2) return -1;  // hard error
+  return len;  // normal: claim all bytes written
 }
 
 int64_t esp_http_client_fetch_headers(esp_http_client_handle_t /*client*/) {
