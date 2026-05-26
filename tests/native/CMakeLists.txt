@@ -15,9 +15,15 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 # ── Test executable ───────────────────────────────────────────────────────────
+#
+# We compile the real http_request_async_idf.cpp rather than component_stubs.cpp.
+# All esp_http_client_* calls are intercepted by idf_http_mock.cpp, which provides
+# controllable stub implementations.  This lets redirect-following tests exercise
+# the actual IDF-level logic in execute_request_() without any hardware.
 add_executable(test_runner
   main.cpp
-  component_stubs.cpp   # native implementations of base class methods
+  idf_http_mock.cpp
+  ../../components/http_request_async/http_request_async_idf.cpp
 )
 
 target_include_directories(test_runner PRIVATE
