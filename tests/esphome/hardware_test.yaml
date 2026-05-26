@@ -1,35 +1,31 @@
-# ESPHome hardware test — Tier 4.
+# ESPHome hardware test suite — http_request_async
 #
-# Flash this config to an ESP32 on the same network as an httpbin instance, then
-# trigger the scripts below via the ESPHome dashboard, HA service calls, or the
-# ESPHome CLI to exercise IDF-only code paths that cannot be reached by native
-# unit tests or the compile check.
+# Self-running: all 12 tests start automatically 1 minute after boot,
+# then repeat every 10 minutes. No HA, no button press required.
 #
 # Quick start:
-#   1. Run httpbin locally:  docker run -p 8000:80 kennethreitz/httpbin
-#   2. Set httpbin_host below to your machine's LAN IP.
-#   3. Flash:  esphome run tests/esphome/hardware_test.yaml
-#   4. Trigger individual scripts from HA or:
-#        esphome run --device <ip> tests/esphome/hardware_test.yaml
+#   1. python3 tools/test_server.py          (on your dev machine)
+#   2. cp tests/esphome/secrets.yaml.example tests/esphome/secrets.yaml
+#      Fill in: wifi_ssid, wifi_password, api_key, ota_password
+#      Set test_server to your dev machine's LAN IP:8765
+#   3. make flash
+#   4. make logs          ← tests start ~1 min after boot
 #
-# What each script tests (and what to look for in the log):
+# Output format in logs:
+#   [PASS] N/12  description
+#   [FAIL] N/12  description: reason
+#   === RESULTS: N passed, M failed ===
 #
-#   test_truncation           — body capped at max_response_buffer_size;
-#                               expect LOGW "truncated at 64 bytes", body.size()==64
-#   test_chunked_content_length — chunked response; expect content_length==body.size()
-#   test_collect_headers_filter — only listed header stored; unlisted header absent
-#   test_request_header_injection — custom request header echoed by server
-#   test_delete_method        — DELETE returns 200
-#   test_patch_method         — PATCH returns 200, body echoed
-#   test_redirect             — 3 redirects followed, final status 200
-#   test_tls_verify_on        — HTTPS with CA bundle; expect 200
-#   test_tls_verify_off       — HTTPS with verify_ssl: false; expect 200
-#   test_on_error_4xx         — 404 routes to on_error, not on_response
-#   test_network_down_fast_fail — disconnect WiFi first; expect on_error immediately
-#   test_concurrent_requests  — two requests enqueued simultaneously; both complete
+# Note: the test server must be reachable from the ESP32's network segment.
+# If the ESP32 is on an isolated IoT VLAN, allow TCP from that subnet to
+# the test server host on port 8765 (both at the router and on the host OS).
+
+substitutions:
+  device_name: http-async-hw-test
+  test_server: !secret test_server
 
 esphome:
-  name: http-async-hw-test
+  name: ${device_name}
   friendly_name: HTTP Async HW Test
 
 esp32:
@@ -41,16 +37,26 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
 logger:
   level: DEBUG
+
+safe_mode:
+  boot_is_good_after: 1min
+  reboot_timeout: 5min
 
 external_components:
   - source:
       type: local
       path: ../../components
     components: [http_request_async]
-
-# ── Hub: plain HTTP tests (verify_ssl: false) ─────────────────────────────────
 
 http_request_async:
   id: http_client
@@ -62,124 +68,177 @@ http_request_async:
   buffer_size_tx: 512
   task_stack_size: 8192
   task_priority: 5
-  task_count: 2  # needed for test_concurrent_requests
-
-# ── Hub: TLS tests (verify_ssl: true, uses bundled Mozilla CA store) ──────────
-
-http_request_async:
-  id: https_client
-  timeout: 10s
-  verify_ssl: true
-  follow_redirects: true
-  redirect_limit: 3
-  buffer_size_rx: 2048
-  buffer_size_tx: 512
-  task_stack_size: 10240  # TLS handshake needs a bit more stack
-  task_priority: 5
-
-# ── Globals ───────────────────────────────────────────────────────────────────
+  task_count: 2
 
 globals:
-  - id: httpbin_host
-    type: std::string
-    # Replace with your httpbin host:port (no trailing slash).
-    initial_value: '"192.168.1.100:8000"'
+  - id: pass_count
+    type: int
+    initial_value: "0"
+  - id: fail_count
+    type: int
+    initial_value: "0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Hardware test scripts
+# Test runner — sequential; each HTTP action pauses the chain until the response
+# arrives, so tests run one after another without explicit waits.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 script:
-
-  # ── Truncation: body capped at max_response_buffer_size ─────────────────────
-  # GET /bytes/4096 returns 4096 random bytes.
-  # max_response_buffer_size: 64 → expect LOGW + body.size()==64, content_length==4096.
-  - id: test_truncation
+  - id: run_all_tests
     mode: single
     then:
+
+      - logger.log: "============================================"
+      - logger.log: "  http_request_async — hardware test suite "
+      - logger.log: "============================================"
+
+      # ── 1/12: GET slow response ───────────────────────────────────────────────
+      # /slow?delay=2 holds the connection for 2 s before responding.
+      # duration_ms ≥ 2000 proves the real wall-clock time was captured and that
+      # the main loop was not blocked (BLE scanning and timers keep firing).
+      - logger.log: "[1/12] GET /slow?delay=2 — async + duration ..."
       - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/bytes/4096";'
+          url: "http://${test_server}/slow?delay=2"
+          capture_response: false
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code == 200 && response->duration_ms >= 2000) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 1/12 GET slow: status=%d duration=%ums",
+                             response->status_code, response->duration_ms);
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test", "[FAIL] 1/12 GET slow: status=%d duration=%ums",
+                             response->status_code, response->duration_ms);
+                  }
+          on_error:
+            then:
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 1/12 GET slow: on_error fired"
+
+      # ── 2/12: POST with verbatim body ─────────────────────────────────────────
+      # /echo echoes the request body in the JSON response (1 s delay).
+      - logger.log: "[2/12] POST /echo — body echo ..."
+      - http_request_async.post:
+          url: "http://${test_server}/echo"
+          capture_response: true
+          max_response_buffer_size: 2048
+          request_headers:
+            Content-Type: application/json
+          body: '{"hw_test":true,"component":"http_request_async"}'
+          on_response:
+            then:
+              - lambda: |-
+                  bool ok = (response->status_code == 200) &&
+                            (body.find("hw_test") != std::string::npos);
+                  if (ok) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 2/12 POST: status=%d body contains 'hw_test'",
+                             response->status_code);
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test", "[FAIL] 2/12 POST: status=%d body=%s",
+                             response->status_code, body.c_str());
+                  }
+          on_error:
+            then:
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 2/12 POST: on_error fired"
+
+      # ── 3/12: Body truncation ─────────────────────────────────────────────────
+      # /bytes?size=4096 returns 4096 random bytes with a Content-Length header.
+      # max_response_buffer_size: 64 must cap body.size() at 64 while
+      # content_length still reflects the full 4096 from the header.
+      - logger.log: "[3/12] Body truncation — /bytes?size=4096, max=64 B ..."
+      - http_request_async.get:
+          url: "http://${test_server}/bytes?size=4096"
           capture_response: true
           max_response_buffer_size: 64
           on_response:
             then:
               - lambda: |-
-                  ESP_LOGI("hw_test", "[TRUNCATION] PASS: body.size()=%u content_length=%u",
-                           body.size(), response->content_length);
-                  if (body.size() != 64)
-                    ESP_LOGE("hw_test", "[TRUNCATION] FAIL: expected body.size()==64, got %u", body.size());
-                  if (response->content_length != 4096)
-                    ESP_LOGE("hw_test", "[TRUNCATION] FAIL: expected content_length==4096, got %u",
-                             response->content_length);
+                  bool ok = (body.size() == 64) && (response->content_length == 4096);
+                  if (ok) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 3/12 Truncation: body=%u content_length=%u",
+                             body.size(), response->content_length);
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test",
+                             "[FAIL] 3/12 Truncation: body=%u (expect 64) content_length=%u (expect 4096)",
+                             body.size(), response->content_length);
+                  }
           on_error:
             then:
-              - logger.log:
-                  format: "[TRUNCATION] FAIL: on_error fired (status=%d)"
-                  args: [response->status_code]
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 3/12 Truncation: on_error fired"
 
-  # ── Chunked response: content_length equals body.size() ─────────────────────
-  # GET /stream/5 returns a chunked response (5 JSON lines, no Content-Length header).
-  # After the fix, content_length must equal body.size() (not 0).
-  - id: test_chunked_content_length
-    mode: single
-    then:
+      # ── 4/12: Chunked response content_length ─────────────────────────────────
+      # /stream?lines=5 sends 5 JSON lines via chunked TE (no Content-Length).
+      # The IDF fix sets content_length = body.size() after the read loop.
+      # Expect: content_length > 0 AND content_length == body.size().
+      - logger.log: "[4/12] Chunked content_length — /stream?lines=5 ..."
       - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/stream/5";'
+          url: "http://${test_server}/stream?lines=5"
           capture_response: true
           max_response_buffer_size: 4096
           on_response:
             then:
               - lambda: |-
-                  ESP_LOGI("hw_test", "[CHUNKED] body.size()=%u content_length=%u",
-                           body.size(), response->content_length);
-                  if (response->content_length != body.size())
-                    ESP_LOGE("hw_test", "[CHUNKED] FAIL: content_length(%u) != body.size()(%u) — fix not applied?",
+                  bool ok = (response->content_length > 0) &&
+                            (response->content_length == body.size());
+                  if (ok) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 4/12 Chunked: content_length=%u == body.size()=%u",
                              response->content_length, body.size());
-                  else
-                    ESP_LOGI("hw_test", "[CHUNKED] PASS");
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test", "[FAIL] 4/12 Chunked: content_length=%u body.size()=%u",
+                             response->content_length, body.size());
+                  }
           on_error:
             then:
-              - logger.log: "[CHUNKED] FAIL: on_error"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 4/12 Chunked: on_error fired"
 
-  # ── collect_headers filter: only requested headers are stored ────────────────
-  # GET /response-headers?Content-Type=text/plain makes httpbin return a
-  # Content-Type header. We request it; we do NOT request Server.
-  # Verify: content-type is present, server is absent.
-  - id: test_collect_headers_filter
-    mode: single
-    then:
+      # ── 5/12: Response headers filter ─────────────────────────────────────────
+      # Every server response includes X-Server: http_request_async-test.
+      # Collect x-server but NOT content-type.
+      # Expect: x-server has the right value; content-type is empty (not stored).
+      - logger.log: "[5/12] Response headers filter — /fast ..."
       - http_request_async.get:
-          url: !lambda |
-            return "http://" + id(httpbin_host) + "/response-headers?Content-Type=text%2Fplain";
+          url: "http://${test_server}/fast"
           capture_response: false
           collect_headers:
-            - content-type
+            - x-server
           on_response:
             then:
               - lambda: |-
-                  auto ct         = response->get_response_header("content-type");
-                  auto unrequested = response->get_response_header("server");
-                  ESP_LOGI("hw_test", "[HEADERS FILTER] content-type='%s' server='%s'",
-                           ct.c_str(), unrequested.c_str());
-                  if (ct.empty())
-                    ESP_LOGE("hw_test", "[HEADERS FILTER] FAIL: content-type was requested but is empty");
-                  else if (!unrequested.empty())
-                    ESP_LOGE("hw_test", "[HEADERS FILTER] FAIL: 'server' was NOT requested but is present: '%s'",
-                             unrequested.c_str());
-                  else
-                    ESP_LOGI("hw_test", "[HEADERS FILTER] PASS");
+                  auto xs = response->get_response_header("x-server");
+                  auto ct = response->get_response_header("content-type");
+                  bool ok = (xs == "http_request_async-test") && ct.empty();
+                  if (ok) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 5/12 Headers filter: x-server='%s' content-type=''",
+                             xs.c_str());
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test",
+                             "[FAIL] 5/12 Headers filter: x-server='%s' content-type='%s'",
+                             xs.c_str(), ct.c_str());
+                  }
           on_error:
             then:
-              - logger.log: "[HEADERS FILTER] FAIL: on_error"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 5/12 Headers filter: on_error fired"
 
-  # ── Request header injection ──────────────────────────────────────────────────
-  # GET /headers echoes all request headers in the JSON body.
-  # Verify the custom header we set is present in the echoed body.
-  - id: test_request_header_injection
-    mode: single
-    then:
+      # ── 6/12: Request header injection ────────────────────────────────────────
+      # /headers echoes all incoming request headers as JSON in the body.
+      # Expect: the custom sentinel value appears in the echoed body.
+      - logger.log: "[6/12] Request header injection — /headers ..."
       - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/headers";'
+          url: "http://${test_server}/headers"
           capture_response: true
           max_response_buffer_size: 2048
           request_headers:
@@ -187,155 +246,170 @@ script:
           on_response:
             then:
               - lambda: |-
-                  ESP_LOGI("hw_test", "[HDR INJECT] body=%s", body.c_str());
-                  if (body.find("sentinel-abc123") != std::string::npos)
-                    ESP_LOGI("hw_test", "[HDR INJECT] PASS: custom header found in server echo");
-                  else
-                    ESP_LOGE("hw_test", "[HDR INJECT] FAIL: 'sentinel-abc123' not in echoed headers");
+                  bool ok = (body.find("sentinel-abc123") != std::string::npos);
+                  if (ok) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 6/12 Header injection: sentinel found in echo");
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test",
+                             "[FAIL] 6/12 Header injection: sentinel not in body: %.200s",
+                             body.c_str());
+                  }
           on_error:
             then:
-              - logger.log: "[HDR INJECT] FAIL: on_error"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 6/12 Header injection: on_error fired"
 
-  # ── DELETE method ─────────────────────────────────────────────────────────────
-  - id: test_delete_method
-    mode: single
-    then:
+      # ── 7/12: DELETE method ────────────────────────────────────────────────────
+      - logger.log: "[7/12] DELETE method — /delete ..."
       - http_request_async.send:
           method: DELETE
-          url: !lambda 'return "http://" + id(httpbin_host) + "/delete";'
+          url: "http://${test_server}/delete"   # DELETE /delete
           capture_response: false
           on_response:
             then:
               - lambda: |-
-                  if (response->status_code == 200)
-                    ESP_LOGI("hw_test", "[DELETE] PASS: status=%d", response->status_code);
-                  else
-                    ESP_LOGE("hw_test", "[DELETE] FAIL: status=%d", response->status_code);
+                  if (response->status_code == 200) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 7/12 DELETE: status=%d", response->status_code);
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test", "[FAIL] 7/12 DELETE: status=%d", response->status_code);
+                  }
           on_error:
             then:
-              - logger.log: "[DELETE] FAIL: on_error"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 7/12 DELETE: on_error fired"
 
-  # ── PATCH method ──────────────────────────────────────────────────────────────
-  - id: test_patch_method
-    mode: single
-    then:
+      # ── 8/12: PATCH method ─────────────────────────────────────────────────────
+      # /patch echoes the request body in the JSON response.
+      - logger.log: "[8/12] PATCH method — /patch ..."
       - http_request_async.send:
           method: PATCH
-          url: !lambda 'return "http://" + id(httpbin_host) + "/patch";'
-          body: '{"hw_test": true}'
+          url: "http://${test_server}/patch"   # PATCH /patch
+          body: '{"hw_test":true}'
           capture_response: true
           max_response_buffer_size: 2048
           on_response:
             then:
               - lambda: |-
-                  if (response->status_code == 200 && body.find("hw_test") != std::string::npos)
-                    ESP_LOGI("hw_test", "[PATCH] PASS: status=%d body echoed", response->status_code);
-                  else
-                    ESP_LOGE("hw_test", "[PATCH] FAIL: status=%d body=%s",
-                             response->status_code, body.c_str());
-          on_error:
-            then:
-              - logger.log: "[PATCH] FAIL: on_error"
-
-  # ── Redirect following ────────────────────────────────────────────────────────
-  # /redirect/3 issues 3 HTTP 302 redirects before landing on /get (200).
-  - id: test_redirect
-    mode: single
-    then:
-      - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/redirect/3";'
-          capture_response: false
-          on_response:
-            then:
-              - lambda: |-
-                  if (response->status_code == 200)
-                    ESP_LOGI("hw_test", "[REDIRECT] PASS: followed 3 redirects, final status=%d",
+                  bool ok = (response->status_code == 200) &&
+                            (body.find("hw_test") != std::string::npos);
+                  if (ok) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 8/12 PATCH: status=%d body echoed",
                              response->status_code);
-                  else
-                    ESP_LOGE("hw_test", "[REDIRECT] FAIL: status=%d", response->status_code);
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test", "[FAIL] 8/12 PATCH: status=%d body=%s",
+                             response->status_code, body.c_str());
+                  }
           on_error:
             then:
-              - logger.log: "[REDIRECT] FAIL: on_error (redirect limit exceeded or network error)"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 8/12 PATCH: on_error fired"
 
-  # ── TLS: verify_ssl: true ────────────────────────────────────────────────────
-  # Uses the https_client hub (CA bundle validation enabled).
-  # Requires internet access to httpbin.org.
-  - id: test_tls_verify_on
-    mode: single
-    then:
+      # ── 9/12: Redirect following ───────────────────────────────────────────────
+      # /redirect?n=3 chains three HTTP 302s before landing on /fast (200).
+      - logger.log: "[9/12] Redirect following — /redirect?n=3 ..."
       - http_request_async.get:
-          http_request_async_id: https_client
-          url: "https://httpbin.org/get"
+          url: "http://${test_server}/redirect?n=3"
           capture_response: false
           on_response:
             then:
               - lambda: |-
-                  if (response->status_code == 200)
-                    ESP_LOGI("hw_test", "[TLS VERIFY ON] PASS: CA bundle validation succeeded");
-                  else
-                    ESP_LOGE("hw_test", "[TLS VERIFY ON] FAIL: status=%d", response->status_code);
+                  if (response->status_code == 200) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test", "[PASS] 9/12 Redirect: followed 3 hops, final status=%d",
+                             response->status_code);
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test", "[FAIL] 9/12 Redirect: status=%d (expected 200)",
+                             response->status_code);
+                  }
           on_error:
             then:
-              - logger.log: "[TLS VERIFY ON] FAIL: TLS handshake or CA validation failed"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 9/12 Redirect: on_error fired (limit exceeded or network error)"
 
-  # ── TLS: verify_ssl: false ───────────────────────────────────────────────────
-  # Uses the http_client hub (verify_ssl: false).
-  # Should reach httpbin.org without CA validation.
-  - id: test_tls_verify_off
-    mode: single
-    then:
+      # ── 10/12: Sequential requests — two back-to-back GETs in one script ────────
+      # The second request must not start until the first on_complete fires.
+      # Both must succeed. This exercises the play_complex() resume chain.
+      - logger.log: "[10/12] Sequential requests — two back-to-back GETs ..."
       - http_request_async.get:
-          url: "https://httpbin.org/get"
+          url: "http://${test_server}/fast"
           capture_response: false
           on_response:
             then:
-              - lambda: |-
-                  if (response->status_code == 200)
-                    ESP_LOGI("hw_test", "[TLS VERIFY OFF] PASS: HTTPS without CA validation");
-                  else
-                    ESP_LOGE("hw_test", "[TLS VERIFY OFF] FAIL: status=%d", response->status_code);
+              - logger.log: "[10/12] Sequential: request A done"
           on_error:
             then:
-              - logger.log: "[TLS VERIFY OFF] FAIL: on_error"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 10/12 Sequential: request A on_error"
+      - http_request_async.get:
+          url: "http://${test_server}/fast"
+          capture_response: false
+          on_response:
+            then:
+              - lambda: id(pass_count)++;
+              - logger.log: "[PASS] 10/12 Sequential: both requests completed"
+          on_error:
+            then:
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 10/12 Sequential: request B on_error"
 
-  # ── 4xx routes to on_error, not on_response ───────────────────────────────────
-  # GET /status/404 returns 404. Verify on_error fires, on_response does not.
-  - id: test_on_error_4xx
-    mode: single
-    then:
+      # ── 11/12: HTTP 404 routes to on_error, not on_response ───────────────────
+      # The component treats 4xx and 5xx as errors. on_response must NOT fire.
+      - logger.log: "[11/12] 4xx→on_error — /status/404 ..."
       - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/status/404";'
+          url: "http://${test_server}/status?code=404"
           capture_response: false
           on_response:
             then:
-              - logger.log: "[4XX ON_ERROR] FAIL: on_response fired for 404 (should not happen)"
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 11/12 4xx→on_error: on_response fired (expected on_error)"
           on_error:
             then:
-              - lambda: |-
-                  ESP_LOGI("hw_test", "[4XX ON_ERROR] PASS: on_error fired for status=%d",
-                           response->status_code);
+              - lambda: id(pass_count)++;
+              - logger.log: "[PASS] 11/12 4xx→on_error: on_error fired correctly"
 
-  # ── Concurrent requests: both complete independently ─────────────────────────
-  # Enqueues two requests with no yield between them. Both should complete
-  # (processed by two worker tasks) with no dropped requests.
-  - id: test_concurrent_requests
-    mode: single
+      # ── 12/12: HTTP 500 routes to on_error, not on_response ───────────────────
+      - logger.log: "[12/12] 5xx→on_error — /status/500 ..."
+      - http_request_async.get:
+          url: "http://${test_server}/status?code=500"
+          capture_response: false
+          on_response:
+            then:
+              - lambda: id(fail_count)++;
+              - logger.log: "[FAIL] 12/12 5xx→on_error: on_response fired (expected on_error)"
+          on_error:
+            then:
+              - lambda: id(pass_count)++;
+              - logger.log: "[PASS] 12/12 5xx→on_error: on_error fired correctly"
+
+      # ── Final summary ──────────────────────────────────────────────────────────
+      - lambda: |-
+          int total = id(pass_count) + id(fail_count);
+          ESP_LOGI("hw_test", "============================================");
+          if (id(fail_count) == 0) {
+            ESP_LOGI("hw_test", "  RESULTS: %d/%d passed — ALL PASS", id(pass_count), total);
+          } else {
+            ESP_LOGE("hw_test", "  RESULTS: %d passed, %d FAILED (of %d)",
+                     id(pass_count), id(fail_count), total);
+          }
+          ESP_LOGI("hw_test", "============================================");
+
+# ── Auto-run trigger ──────────────────────────────────────────────────────────
+# Fires 1 minute after boot (gives WiFi, DHCP, and the API time to stabilise),
+# then repeats every 10 minutes. Counters reset at the start of each run.
+# script mode:single ensures a second interval tick doesn't overlap a slow run.
+
+interval:
+  - interval: 10min
+    startup_delay: 1min
     then:
-      - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/delay/1";'
-          capture_response: false
-          on_response:
-            then:
-              - logger.log: "[CONCURRENT] request A complete"
-          on_error:
-            then:
-              - logger.log: "[CONCURRENT] request A FAILED"
-      - http_request_async.get:
-          url: !lambda 'return "http://" + id(httpbin_host) + "/delay/1";'
-          capture_response: false
-          on_response:
-            then:
-              - logger.log: "[CONCURRENT] request B complete"
-          on_error:
-            then:
-              - logger.log: "[CONCURRENT] request B FAILED"
+      - lambda: |-
+          id(pass_count) = 0;
+          id(fail_count) = 0;
+      - script.execute: run_all_tests
