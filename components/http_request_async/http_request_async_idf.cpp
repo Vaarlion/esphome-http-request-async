@@ -336,10 +336,7 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
       container->success = false;
       container->duration_ms =
           static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000ULL);
-      if (xQueueSend(this->response_queue_, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGE(TAG, "Response queue full — request to %s leaked", req->url.c_str());
-        delete req;  // NOLINT
-      }
+      xQueueSend(this->response_queue_, &req, portMAX_DELAY);
       return;
     }
 
@@ -446,12 +443,10 @@ void HttpRequestAsyncComponent::execute_request_(PendingRequest *req) {
   esp_http_client_cleanup(client);
 
   // Hand the completed request to the main loop task.
-  if (xQueueSend(this->response_queue_, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-    // Response queue full — this should not happen in normal operation.
-    // If it does, both memory and the automation will leak.
-    ESP_LOGE(TAG, "Response queue full — request to %s leaked", req->url.c_str());
-    delete req;  // NOLINT: prevent heap leak; automation will stall
-  }
+  // portMAX_DELAY: the worker blocks until loop() drains at least one slot.
+  // This guarantees on_complete_cb always fires — automation never permanently stalls,
+  // even when the main loop is temporarily busy and the response queue fills up.
+  xQueueSend(this->response_queue_, &req, portMAX_DELAY);
 }
 
 }  // namespace http_request_async

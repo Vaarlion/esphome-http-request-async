@@ -59,10 +59,16 @@ inline QueueHandle_t xQueueCreate(uint32_t depth, uint32_t /*item_size*/) {
 
 inline BaseType_t xQueueSend(QueueHandle_t q, const void *item,
                               TickType_t timeout) {
-  // Non-blocking sends (timeout == 0) respect the depth limit, matching real
-  // FreeRTOS behaviour. Blocking sends (portMAX_DELAY or any non-zero timeout)
-  // always succeed — the mock has no scheduler to actually block on.
-  if (timeout == 0 && q->q.size() >= q->max_depth_) {
+  // portMAX_DELAY: block forever until space is available.
+  // In the single-threaded mock this always succeeds — simulating that the
+  // scheduler would eventually unblock the sender once loop() drains a slot.
+  //
+  // All *finite* timeouts (including 0) fail immediately if the queue is full.
+  // This mirrors real FreeRTOS semantics: a timed send returns pdFALSE once the
+  // deadline expires and the queue is still full. Tests that rely on queue-full
+  // behaviour (e.g. enqueue_request overflow) use timeout=0; tests that verify
+  // portMAX_DELAY never drops a request use a blocking send and expect success.
+  if (timeout != portMAX_DELAY && q->q.size() >= q->max_depth_) {
     return pdFALSE;
   }
   void *val = nullptr;
