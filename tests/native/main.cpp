@@ -978,6 +978,59 @@ TEST(HttpRequestAsync, IdfRedirectClearsIntermediateHeaders) {
   EXPECT_EQ(captured_header, "prod");
 }
 
+// ── Response queue overflow does not permanently stall the automation ─────────
+//
+// Regression test for: if the main loop is blocked long enough for QUEUE_DEPTH
+// (8) responses to pile up, the worker's subsequent xQueueSend to the response
+// queue would fail (old code used pdMS_TO_TICKS(100)), req was deleted without
+// calling on_complete_cb — permanently stalling the automation until reboot.
+// No recovery mechanism existed.
+//
+// Fix: use portMAX_DELAY. The worker blocks until loop() drains at least one
+// slot.  In the mock, portMAX_DELAY sends always succeed (simulating eventual
+// unblock by the scheduler), so every on_complete_cb fires regardless of how
+// full the response queue is.
+//
+// Uses IdfMockHttpRequestAsyncComponent (real execute_request_()) so the
+// xQueueSend timeout in the production code is what is actually under test.
+// The mock's xQueueSend enforces the depth cap for all *finite* timeouts;
+// only portMAX_DELAY is allowed to exceed it.
+
+TEST(HttpRequestAsync, IdfResponseQueueFullDoesNotStallAutomation) {
+  g_idf_mock.reset();
+  // status_codes queue is empty → esp_http_client_get_status_code() returns 200
+  // by default for all requests.
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  const int QUEUE_CAP = 8;
+  int complete_count = 0;
+
+  // Step 1: Fill the response queue to capacity without draining the main loop.
+  for (int i = 0; i < QUEUE_CAP; i++) {
+    auto *req = make_request();
+    req->on_complete_cb = [&]() { complete_count++; };
+    comp.enqueue_request(req);
+  }
+  comp.pump_worker();            // Processes all 8; response queue is now full.
+  ASSERT_EQ(complete_count, 0); // loop() not called yet — no callbacks fired.
+
+  // Step 2: Enqueue and process one more request while the response queue is full.
+  // With portMAX_DELAY: the send "blocks until a slot opens" (mock: always succeeds).
+  // With the old pdMS_TO_TICKS(100): the mock enforces the depth cap for finite
+  // timeouts, the send fails, req is deleted, and on_complete_cb is never called.
+  {
+    auto *req = make_request();
+    req->on_complete_cb = [&]() { complete_count++; };
+    comp.enqueue_request(req);
+    comp.pump_worker();
+  }
+
+  // Step 3: Drain all responses — every on_complete_cb must have fired.
+  comp.pump_responses();
+  EXPECT_EQ(complete_count, QUEUE_CAP + 1);
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
