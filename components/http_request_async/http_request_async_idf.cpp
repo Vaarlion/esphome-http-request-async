@@ -16,6 +16,8 @@
 namespace esphome {
 namespace http_request_async {
 
+static const char *const TAG = "http_request_async";
+
 // ── Event handler context ─────────────────────────────────────────────────────
 
 /// Passed as user_data to esp_http_client_config_t.event_handler.

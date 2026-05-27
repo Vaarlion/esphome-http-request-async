@@ -24,8 +24,6 @@
 namespace esphome {
 namespace http_request_async {
 
-static const char *const TAG = "http_request_async";
-
 // ── Data types ────────────────────────────────────────────────────────────────
 
 struct Header {
