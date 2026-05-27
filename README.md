@@ -387,8 +387,14 @@ For integers, booleans, arrays, or nested objects, use the lambda form instead:
 
 When `capture_response: true` and the response exceeds `max_response_buffer_size`,
 the body is silently truncated and a `WARN` is logged — but the callback receives
-no `body_truncated` flag or indication that the data is incomplete. JSON parse
-failures are the typical symptom. See
+no flag indicating the data is incomplete. The typical symptom is a silent JSON
+parse failure. Work around it by setting `max_response_buffer_size` large enough
+for the largest response you expect, or by comparing `body.size()` against
+`response->content_length` in the callback.
+
+This is the same behaviour as the upstream `http_request` component. There is no
+open ESPHome issue tracking it ([#13669](https://github.com/esphome/esphome/issues/13669)
+was related but covered a different read-loop bug, now closed). See
 [Response body buffering](#response-body-buffering) for size guidance.
 
 ### Request queue depth is fixed at 8
