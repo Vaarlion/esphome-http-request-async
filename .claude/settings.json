@@ -1,15 +1,11 @@
 {
   "permissions": {
+    "deny": [
+      "Read(./tests/esphome/secrets.yaml)",
+      "Read(**/secrets.yaml)"
+    ],
     "allow": [
-      "Bash(make*)",
-      "Bash(cmake*)",
-      "Bash(pytest*)",
-      "Bash(./tests/native/build/test_runner*)",
-      "Bash(esphome compile*)",
-      "Bash(find * -type f*)",
-      "Bash(grep -r*)",
-      "Bash(grep -E*)",
-      "Bash(cat *)"
+      "Bash(make*)"
     ]
   }
 }
