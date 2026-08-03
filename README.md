@@ -403,6 +403,39 @@ The pending-request queue holds 8 entries. A 9th enqueue fires `on_error`
 immediately and drops the request. See [Concurrency](#concurrency) for
 sizing and mitigation strategies.
 
+### Nested requests cannot declare their own `on_response`/`on_error`
+
+Chaining a second request from inside the `on_response` of a
+`capture_response: true` request works, and the outer `response` and `body` stay
+usable in the nested action:
+
+```yaml
+- http_request_async.get:
+    url: "http://device/status"
+    capture_response: true
+    on_response:
+      then:
+        - http_request_async.post:
+            url: "http://logger/report"
+            json:
+              upstream: !lambda 'return body;'   # outer body — fine
+```
+
+What does **not** compile is giving that nested action an `on_response` or
+`on_error` of its own. ESPHome names trigger lambda parameters positionally and
+appends the enclosing trigger's variables, so the inner lambda would be generated
+with two parameters called `response`:
+
+```
+error: redefinition of 'std::shared_ptr<HttpContainer> response'
+```
+
+This is an ESPHome codegen limitation, not specific to this component — the
+built-in `http_request` behaves identically. Work around it by moving the nested
+request into its own `script` and calling `script.execute`, which gives the inner
+triggers a clean parameter scope. Note that `script.execute` does not wait for the
+script to finish; use `script.wait` afterwards if the chain must stay sequential.
+
 ### `verify_ssl: false` depends on sdkconfig
 
 `verify_ssl: false` works by emitting two sdkconfig flags at compile time:

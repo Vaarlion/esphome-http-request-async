@@ -86,7 +86,7 @@ http_request_async/
 │   │       └── esphome/**/*.h      ← empty stubs (types in esphome_compat.h)
 │   └── esphome/
 │       ├── test_config.yaml        ← Tier 3: ESPHome compile check (no secrets, no flash)
-│       ├── hardware_test.yaml      ← Tier 4: self-running hardware test suite (12 tests)
+│       ├── hardware_test.yaml      ← Tier 4: self-running hardware test suite (13 tests)
 │       ├── secrets.yaml            ← gitignored; copy from secrets.yaml.example
 │       └── secrets.yaml.example   ← template (wifi, api, ota)
 │
@@ -174,7 +174,7 @@ imports that can't be caught locally. Requires ESPHome installed.
 
 **Tier 4 — Hardware** (`make flash`): Self-running test suite in
 `tests/esphome/hardware_test.yaml`. Flash to an ESP32, watch the logs — all
-12 tests start automatically ~1 min after boot. No HA, no dashboard required.
+13 tests start automatically ~1 min after boot. No HA, no dashboard required.
 Run before tagging a release. Requires `python3 tools/test_server.py` running
 on the dev machine and reachable from the ESP32's network segment.
 

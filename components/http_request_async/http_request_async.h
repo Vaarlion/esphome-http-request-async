@@ -251,13 +251,21 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
     }
 
     // Body: verbatim string takes priority; then JSON lambda; then JSON dict
+    //
+    // `mutable` on both build_json lambdas is required, not cosmetic: when this
+    // action is nested inside the on_response of a `capture_response: true`
+    // request, Ts... contains `std::string &` (the outer body). A non-mutable
+    // lambda makes the captured `x...` copies const, and a const std::string
+    // cannot bind to the std::string & that json_func_ and
+    // TemplatableValue::value() expect — the component fails to compile.
+    // Same fix as upstream esphome/esphome#17713.
     if (this->body_.has_value()) {
       req->body = this->body_.value(x...);
     } else if (this->json_func_ != nullptr) {
       req->body = json::build_json(
-          [this, x...](JsonObject root) { this->json_func_(x..., root); });
+          [this, x...](JsonObject root) mutable { this->json_func_(x..., root); });
     } else if (!this->json_pairs_.empty()) {
-      req->body = json::build_json([this, x...](JsonObject root) {
+      req->body = json::build_json([this, x...](JsonObject root) mutable {
         for (const auto &pair : this->json_pairs_) {
           root[pair.first] = pair.second.value(x...);
         }
@@ -274,10 +282,20 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
     this->alive_ = alive;
 
     const bool capture = this->capture_response_;
+    // std::make_tuple decays its arguments, so a `std::string &` in Ts...
+    // becomes an owned std::string here. That is deliberate: the callbacks below
+    // run from loop() long after play_complex() returned, so anything they hand
+    // to the triggers or to the rest of the automation chain must be a copy the
+    // closure owns — never a reference into the caller's dead stack frame.
+    //
+    // The three callbacks are `mutable` for the same reason as the build_json
+    // lambdas above: a const args_tuple yields const elements, which cannot bind
+    // to a `std::string &` in Ts... `mutable` costs nothing here — none of them
+    // actually modifies the captured state.
     auto args_tuple = std::make_tuple(x...);
 
     req->on_response_cb = [this, alive, args_tuple,
-                           capture](std::shared_ptr<HttpContainer> container) {
+                           capture](std::shared_ptr<HttpContainer> container) mutable {
       if (!*alive)
         return;
       if (capture) {
@@ -298,18 +316,23 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
       }
     };
 
-    req->on_error_cb = [this, alive, args_tuple]() {
+    req->on_error_cb = [this, alive, args_tuple]() mutable {
       if (!*alive)
         return;
       std::apply([this](Ts... a) { this->error_trigger_.trigger(a...); },
                  args_tuple);
     };
 
-    req->on_complete_cb = [this, alive, args_tuple]() {
+    req->on_complete_cb = [this, alive, args_tuple]() mutable {
       if (!*alive)
         return;
       this->is_waiting_ = false;
-      this->play_next_tuple_(args_tuple);
+      // play_next_() rather than play_next_tuple_(): the latter takes a
+      // `const std::tuple<Ts...> &`, which for a reference in Ts... would be a
+      // tuple OF references — not convertible from the decayed tuple we hold.
+      // play_next_tuple_() is itself only `play_next_(std::get<S>(tuple)...)`,
+      // so this is equivalent while binding the closure's own copies.
+      std::apply([this](Ts... a) { this->play_next_(a...); }, args_tuple);
     };
 
     this->parent_->enqueue_request(req);
