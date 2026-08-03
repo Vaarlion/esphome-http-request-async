@@ -164,23 +164,13 @@ script:
 
   # ── Test: action nested inside on_response (reference type in Ts...) ────────
   #
-  # Regression test for the const-correctness bug fixed alongside upstream
-  # esphome/esphome#17713. An http_request_async.* action nested in the
-  # on_response of a `capture_response: true` request is generated with
-  # Ts... = (std::shared_ptr<HttpContainer>, std::string &) — the outer body
-  # arrives by non-const reference. Every lambda in play_complex() that captures
-  # x... or args_tuple must be `mutable`, or this config does not compile.
+  # A nested action is generated with Ts... = (shared_ptr<HttpContainer>,
+  # std::string &) — the outer body by non-const reference. Covers all three body
+  # forms plus a chained action, since each reaches a different capture site.
   #
-  # Covers all three body forms plus a chained action, because each one reaches a
-  # different capture site.
-  #
-  # The nested actions deliberately declare NO on_response/on_error of their own.
-  # ESPHome names trigger lambda parameters positionally, so an inner
-  # capture_response trigger would be generated with the outer `response` and
-  # `body` appended to its own — producing two parameters named `response` and
-  # failing to compile. That is an ESPHome codegen limitation, unrelated to this
-  # component; upstream's equivalent regression config (#17713) omits them for
-  # the same reason.
+  # The nested actions declare no on_response/on_error of their own: ESPHome
+  # appends the enclosing trigger's variables to the inner lambda, which would
+  # yield two parameters named `response`. See "Known limitations" in the README.
   - id: test_nested_action_in_on_response
     mode: queued
     then:
@@ -206,8 +196,7 @@ script:
                   method: PUT
                   url: "http://192.168.1.100/inner-send"
                   body: !lambda 'return body;'
-              # Runs only after the nested requests complete: exercises
-              # on_complete_cb → play_next_() with a reference in Ts...
+              # Chained after the nested requests — on_complete_cb → play_next_()
               - logger.log:
                   format: "chain resumed after nested requests, outer body len=%u"
                   args: ["(unsigned) body.size()"]

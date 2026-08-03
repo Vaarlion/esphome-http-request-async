@@ -69,9 +69,8 @@ class MockHttpRequestAsyncComponent : public HttpRequestAsyncComponent {
     pump_responses();
   }
 
-  /// Body of the last request seen by execute_request_(). Lets action-level
-  /// tests assert on what play_complex() actually built (JSON encoding,
-  /// templatable evaluation) rather than only on the response side.
+  /// Body of the last request seen by execute_request_() — lets action-level
+  /// tests assert on what play_complex() built, not just on the response side.
   std::string last_request_body;
 
  protected:
@@ -1109,47 +1108,28 @@ TEST(HttpRequestAsync, IdfWriteNegativeReturnTriggersOnError) {
 // Nested action: reference types in Ts...
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// An http_request_async.* action nested inside the on_response of a
-// `capture_response: true` request is code-generated with
-// Ts... = (std::shared_ptr<HttpContainer>, std::string &) — the outer response
-// body arrives as a NON-CONST reference.
+// An action nested inside the on_response of a capture_response request is
+// generated with Ts... = (std::shared_ptr<HttpContainer>, std::string &): the
+// outer body arrives as a non-const reference. These are primarily COMPILE-TIME
+// guards — a non-mutable lambda in play_complex() makes the captured copies
+// const and the translation unit does not build.
 //
-// Every lambda in play_complex() that captures `x...` or `args_tuple` by copy
-// must therefore be `mutable`. In a non-mutable lambda the captured copies are
-// const, and a `const std::string` will not bind to the `std::string &` that
-// TemplatableValue::value(), json_func_, the triggers and play_next_() all
-// expect. Without `mutable` the translation unit does not compile at all, so
-// these two tests are first and foremost COMPILE-TIME regression guards.
-//
-// Mirrors the upstream fix in esphome/esphome#17713 (shipped in ESPHome
-// 2026.7.3), which added `mutable` to the two build_json lambdas in
-// HttpRequestSendAction::play(). The async action has three further sites that
-// the synchronous upstream action cannot have: the on_response / on_error /
-// on_complete callbacks, which capture args_tuple and outlive play_complex().
-//
-// The runtime assertions pin the ownership semantics that make this safe:
-// args_tuple holds DECAYED COPIES (std::make_tuple decays std::string & to
-// std::string), so the reference handed to the nested trigger and to the rest
-// of the automation chain points at the closure's own copy — which lives as
-// long as the PendingRequest — and never at the outer callback's stack frame,
-// which is gone by the time the inner response arrives.
+// The runtime assertions pin the ownership rule: args_tuple holds decayed
+// copies, so what reaches the triggers and the automation chain is the closure's
+// own copy, never the outer callback's stack frame.
 
-using NestedTs = void (*)(std::shared_ptr<HttpContainer>, std::string &);  // documentation only
 using NestedAction = HttpRequestAsyncSendAction<std::shared_ptr<HttpContainer>, std::string &>;
 using NestedStr = TemplatableValue<std::string, std::shared_ptr<HttpContainer>, std::string &>;
 using NestedMethod = TemplatableValue<const char *, std::shared_ptr<HttpContainer>, std::string &>;
 
 // Stands in for a further action chained after the nested HTTP action, with the
-// same reference-carrying Ts... The default Action::play_complex() runs play()
-// and then advances the chain, which is all this needs.
+// same reference-carrying Ts...
 class MockChainedRefAction : public esphome::Action<std::shared_ptr<HttpContainer>, std::string &> {
  public:
   void play(const std::shared_ptr<HttpContainer> &container, std::string &body) override {
     this->played = true;
     this->seen_body = body;
-    // Proves this really is a mutable reference and that writing through it is
-    // safe: the target is the closure's copy, not the caller's dead stack slot.
-    body += "-touched";
+    body += "-touched";  // the target is the closure's copy, so this is safe
   }
 
   bool played{false};
@@ -1168,8 +1148,7 @@ TEST(HttpRequestAsync, NestedActionJsonDictWithReferenceInTs) {
   action.set_capture_response(true);
   action.set_max_response_buffer_size(4096);
 
-  // TemplatableValue::value() is invoked with Ts..., i.e. with the outer body
-  // as std::string &.
+  // value() is invoked with Ts..., so with the outer body as std::string &.
   action.init_json(1);
   action.add_json(
       "echo", NestedStr(std::function<std::string(std::shared_ptr<HttpContainer>, std::string &)>(
@@ -1187,20 +1166,17 @@ TEST(HttpRequestAsync, NestedActionJsonDictWithReferenceInTs) {
   MockChainedRefAction chained;
   action.set_next(&chained);
 
-  // The outer on_response arguments. `outer_body` is deliberately a local: in
-  // the real component it is a local of on_response_cb, dead long before the
-  // inner response arrives.
+  // The outer on_response arguments. `outer_body` is a local on purpose — in the
+  // component it is a local of on_response_cb, dead before the inner response.
   auto outer_container = std::make_shared<HttpContainer>();
   std::string outer_body = "outer-value";
 
   action.play_complex(outer_container, outer_body);
 
-  // The JSON body was built during play_complex() from the live reference.
   comp.pump_worker();
   EXPECT_EQ(comp.last_request_body, R"({"echo":"outer-value"})");
 
-  // Mutating the caller's string after enqueue must not affect what the
-  // callbacks see — they hold a copy, which is exactly what makes this safe.
+  // The callbacks hold a copy, so this must not reach them.
   outer_body = "mutated-after-enqueue";
 
   comp.pump_responses();
@@ -1253,8 +1229,7 @@ TEST(HttpRequestAsync, NestedActionJsonLambdaWithReferenceInTs) {
 
 // ── on_error path with a reference in Ts... ───────────────────────────────────
 //
-// on_error_cb captures args_tuple too, so it needs the same treatment. A 4xx
-// response is enough to reach it.
+// on_error_cb captures args_tuple too. A 5xx response is enough to reach it.
 
 TEST(HttpRequestAsync, NestedActionOnErrorWithReferenceInTs) {
   MockHttpRequestAsyncComponent comp;

@@ -78,16 +78,18 @@ globals:
   - id: fail_count
     type: int
     initial_value: "0"
-  # 13/13 only: millis() taken just before the nested request is enqueued, so the
-  # action that runs after it can prove the chain actually waited.
+  # 13/13: millis() before the nested request is enqueued
   - id: nested_t0
     type: uint32_t
     initial_value: "0"
-  # 13/13 only: outer body length observed while the nested request's JSON body
-  # was being built (synchronously, inside play_complex()).
+  # 13/13: outer body length seen while the nested JSON body was built
   - id: nested_seen_len
     type: size_t
     initial_value: "0"
+  # 13/13: set once the on_response chain has finished, on every exit path
+  - id: nested_done
+    type: bool
+    initial_value: "false"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test runner — sequential; each HTTP action pauses the chain until the response
@@ -400,25 +402,19 @@ script:
               - logger.log: "[PASS] 12/13 5xx→on_error: on_error fired correctly"
 
       # ── 13/13: Nested request inside on_response (reference in Ts...) ──────────
+      # A nested action carries the outer body through the async round-trip as a
+      # std::string & inside the callback closures. The checks below fail loudly
+      # if what comes back is a dangling reference rather than an owned copy.
       #
-      # An http_request_async.* action nested in the on_response of a
-      # `capture_response: true` request is code-generated with
-      # Ts... = (std::shared_ptr<HttpContainer>, std::string &) — the outer body
-      # arrives by non-const reference and is carried through the async round-trip
-      # inside the callback closures.
+      # /echo sleeps 1 s, so the elapsed check also proves the inner chain waited.
       #
-      # Before the const-correctness fix this config did not compile at all, so
-      # there was no way to reach it on hardware. It is on the suite now because
-      # it is the only test that can catch the *wrong* fix: storing a reference in
-      # args_tuple instead of a decayed copy compiles cleanly and passes every
-      # native test, but on device the outer on_response stack frame is long gone
-      # by the time the nested response arrives — the checks below would then read
-      # freed memory (empty, garbage, or a crash inside LoadProhibited).
-      #
-      # /echo sleeps 1 s, so the elapsed-time check also proves the chain really
-      # waited for the nested request rather than racing past it.
+      # The wait_until is required: a trigger's `then:` block is an independent
+      # automation, so this script resumes without waiting for it. Tests 1–12
+      # increment synchronously inside on_response, this one does not.
       - logger.log: "[13/13] Nested request inside on_response — chained args ..."
-      - lambda: id(nested_seen_len) = 0;
+      - lambda: |-
+          id(nested_seen_len) = 0;
+          id(nested_done) = false;
       - http_request_async.get:
           url: "http://${test_server}/headers"
           capture_response: true
@@ -428,9 +424,7 @@ script:
           on_response:
             then:
               - lambda: id(nested_t0) = millis();
-              # Nested async request. Its JSON body is built from the OUTER
-              # response body, so TemplatableValue::value(Ts...) and json_func_
-              # both receive the std::string & — the two upstream #17713 sites.
+              # JSON body built from the OUTER response body
               - http_request_async.post:
                   url: "http://${test_server}/echo"
                   capture_response: false
@@ -442,9 +436,7 @@ script:
                     root["outer_len"] = to_string(body.size());
                     root["outer_has_sentinel"] =
                         body.find("outer-sentinel-xyz789") != std::string::npos ? "yes" : "no";
-              # Runs only after the nested POST completed, reached via
-              # on_complete_cb → play_next_(). `body` here is still the OUTER
-              # body, delivered from the closure's own copy.
+              # Reached after the nested POST completed; `body` is still the outer body
               - lambda: |-
                   const uint32_t elapsed = millis() - id(nested_t0);
                   const bool waited   = elapsed >= 900;                  // /echo sleeps 1 s
@@ -463,10 +455,24 @@ script:
                              waited, elapsed, intact, same_len,
                              (unsigned) id(nested_seen_len), (unsigned) body.size());
                   }
+                  id(nested_done) = true;
           on_error:
             then:
-              - lambda: id(fail_count)++;
+              - lambda: |-
+                  id(fail_count)++;
+                  id(nested_done) = true;
               - logger.log: "[FAIL] 13/13 Nested: outer request on_error fired"
+
+      # Hold here so the summary below counts test 13
+      - wait_until:
+          condition:
+            lambda: 'return id(nested_done);'
+          timeout: 25s
+      - lambda: |-
+          if (!id(nested_done)) {
+            id(fail_count)++;
+            ESP_LOGE("hw_test", "[FAIL] 13/13 Nested: timed out — chain never resumed");
+          }
 
       # ── Final summary ──────────────────────────────────────────────────────────
       - lambda: |-

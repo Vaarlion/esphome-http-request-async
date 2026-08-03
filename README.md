@@ -436,6 +436,42 @@ request into its own `script` and calling `script.execute`, which gives the inne
 triggers a clean parameter scope. Note that `script.execute` does not wait for the
 script to finish; use `script.wait` afterwards if the chain must stay sequential.
 
+### A nested request does not delay the enclosing chain
+
+The sequential-by-default guarantee (see [Concurrency](#concurrency)) applies to actions in
+the *same* chain. A trigger's `then:` block is a separate automation: `loop()`
+fires `on_response` and then immediately resumes whatever followed the request.
+It does not wait for the trigger's own actions to finish.
+
+So in this script, `logger.log` runs **before** the nested POST completes:
+
+```yaml
+- http_request_async.get:
+    url: "http://device/status"
+    capture_response: true
+    on_response:
+      then:
+        - http_request_async.post:      # still in flight …
+            url: "http://logger/report"
+- logger.log: "done"                    # … when this already ran
+```
+
+Actions *inside* the `then:` block remain correctly ordered relative to each
+other — anything after the nested POST there does wait for it. Only the outer
+chain runs ahead. If the outer chain must wait too, set a global at the end of
+the inner block and gate on it:
+
+```yaml
+- wait_until:
+    condition:
+      lambda: 'return id(nested_done);'
+    timeout: 25s
+```
+
+This is inherent to how ESPHome triggers work and applies to the built-in
+`http_request` as well; it is only more visible here because the nested request
+takes real time without blocking the loop.
+
 ### `verify_ssl: false` depends on sdkconfig
 
 `verify_ssl: false` works by emitting two sdkconfig flags at compile time:
