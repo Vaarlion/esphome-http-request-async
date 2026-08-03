@@ -1,6 +1,6 @@
 # ESPHome hardware test suite — http_request_async
 #
-# Self-running: all 12 tests start automatically 1 minute after boot,
+# Self-running: all 13 tests start automatically 1 minute after boot,
 # then repeat every 10 minutes. No HA, no button press required.
 #
 # Quick start:
@@ -12,8 +12,8 @@
 #   4. make logs          ← tests start ~1 min after boot
 #
 # Output format in logs:
-#   [PASS] N/12  description
-#   [FAIL] N/12  description: reason
+#   [PASS] N/13  description
+#   [FAIL] N/13  description: reason
 #   === RESULTS: N passed, M failed ===
 #
 # Note: the test server must be reachable from the ESP32's network segment.
@@ -78,6 +78,18 @@ globals:
   - id: fail_count
     type: int
     initial_value: "0"
+  # 13/13: millis() before the nested request is enqueued
+  - id: nested_t0
+    type: uint32_t
+    initial_value: "0"
+  # 13/13: outer body length seen while the nested JSON body was built
+  - id: nested_seen_len
+    type: size_t
+    initial_value: "0"
+  # 13/13: set once the on_response chain has finished, on every exit path
+  - id: nested_done
+    type: bool
+    initial_value: "false"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test runner — sequential; each HTTP action pauses the chain until the response
@@ -93,11 +105,11 @@ script:
       - logger.log: "  http_request_async — hardware test suite "
       - logger.log: "============================================"
 
-      # ── 1/12: GET slow response ───────────────────────────────────────────────
+      # ── 1/13: GET slow response ───────────────────────────────────────────────
       # /slow?delay=2 holds the connection for 2 s before responding.
       # duration_ms ≥ 2000 proves the real wall-clock time was captured and that
       # the main loop was not blocked (BLE scanning and timers keep firing).
-      - logger.log: "[1/12] GET /slow?delay=2 — async + duration ..."
+      - logger.log: "[1/13] GET /slow?delay=2 — async + duration ..."
       - http_request_async.get:
           url: "http://${test_server}/slow?delay=2"
           capture_response: false
@@ -106,21 +118,21 @@ script:
               - lambda: |-
                   if (response->status_code == 200 && response->duration_ms >= 2000) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 1/12 GET slow: status=%d duration=%ums",
+                    ESP_LOGI("hw_test", "[PASS] 1/13 GET slow: status=%d duration=%ums",
                              response->status_code, response->duration_ms);
                   } else {
                     id(fail_count)++;
-                    ESP_LOGE("hw_test", "[FAIL] 1/12 GET slow: status=%d duration=%ums",
+                    ESP_LOGE("hw_test", "[FAIL] 1/13 GET slow: status=%d duration=%ums",
                              response->status_code, response->duration_ms);
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 1/12 GET slow: on_error fired"
+              - logger.log: "[FAIL] 1/13 GET slow: on_error fired"
 
-      # ── 2/12: POST with verbatim body ─────────────────────────────────────────
+      # ── 2/13: POST with verbatim body ─────────────────────────────────────────
       # /echo echoes the request body in the JSON response (1 s delay).
-      - logger.log: "[2/12] POST /echo — body echo ..."
+      - logger.log: "[2/13] POST /echo — body echo ..."
       - http_request_async.post:
           url: "http://${test_server}/echo"
           capture_response: true
@@ -135,23 +147,23 @@ script:
                             (body.find("hw_test") != std::string::npos);
                   if (ok) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 2/12 POST: status=%d body contains 'hw_test'",
+                    ESP_LOGI("hw_test", "[PASS] 2/13 POST: status=%d body contains 'hw_test'",
                              response->status_code);
                   } else {
                     id(fail_count)++;
-                    ESP_LOGE("hw_test", "[FAIL] 2/12 POST: status=%d body=%s",
+                    ESP_LOGE("hw_test", "[FAIL] 2/13 POST: status=%d body=%s",
                              response->status_code, body.c_str());
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 2/12 POST: on_error fired"
+              - logger.log: "[FAIL] 2/13 POST: on_error fired"
 
-      # ── 3/12: Body truncation ─────────────────────────────────────────────────
+      # ── 3/13: Body truncation ─────────────────────────────────────────────────
       # /bytes?size=4096 returns 4096 random bytes with a Content-Length header.
       # max_response_buffer_size: 64 must cap body.size() at 64 while
       # content_length still reflects the full 4096 from the header.
-      - logger.log: "[3/12] Body truncation — /bytes?size=4096, max=64 B ..."
+      - logger.log: "[3/13] Body truncation — /bytes?size=4096, max=64 B ..."
       - http_request_async.get:
           url: "http://${test_server}/bytes?size=4096"
           capture_response: true
@@ -162,24 +174,24 @@ script:
                   bool ok = (body.size() == 64) && (response->content_length == 4096);
                   if (ok) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 3/12 Truncation: body=%u content_length=%u",
+                    ESP_LOGI("hw_test", "[PASS] 3/13 Truncation: body=%u content_length=%u",
                              body.size(), response->content_length);
                   } else {
                     id(fail_count)++;
                     ESP_LOGE("hw_test",
-                             "[FAIL] 3/12 Truncation: body=%u (expect 64) content_length=%u (expect 4096)",
+                             "[FAIL] 3/13 Truncation: body=%u (expect 64) content_length=%u (expect 4096)",
                              body.size(), response->content_length);
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 3/12 Truncation: on_error fired"
+              - logger.log: "[FAIL] 3/13 Truncation: on_error fired"
 
-      # ── 4/12: Chunked response content_length ─────────────────────────────────
+      # ── 4/13: Chunked response content_length ─────────────────────────────────
       # /stream?lines=5 sends 5 JSON lines via chunked TE (no Content-Length).
       # The IDF fix sets content_length = body.size() after the read loop.
       # Expect: content_length > 0 AND content_length == body.size().
-      - logger.log: "[4/12] Chunked content_length — /stream?lines=5 ..."
+      - logger.log: "[4/13] Chunked content_length — /stream?lines=5 ..."
       - http_request_async.get:
           url: "http://${test_server}/stream?lines=5"
           capture_response: true
@@ -191,23 +203,23 @@ script:
                             (response->content_length == body.size());
                   if (ok) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 4/12 Chunked: content_length=%u == body.size()=%u",
+                    ESP_LOGI("hw_test", "[PASS] 4/13 Chunked: content_length=%u == body.size()=%u",
                              response->content_length, body.size());
                   } else {
                     id(fail_count)++;
-                    ESP_LOGE("hw_test", "[FAIL] 4/12 Chunked: content_length=%u body.size()=%u",
+                    ESP_LOGE("hw_test", "[FAIL] 4/13 Chunked: content_length=%u body.size()=%u",
                              response->content_length, body.size());
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 4/12 Chunked: on_error fired"
+              - logger.log: "[FAIL] 4/13 Chunked: on_error fired"
 
-      # ── 5/12: Response headers filter ─────────────────────────────────────────
+      # ── 5/13: Response headers filter ─────────────────────────────────────────
       # Every server response includes X-Server: http_request_async-test.
       # Collect x-server but NOT content-type.
       # Expect: x-server has the right value; content-type is empty (not stored).
-      - logger.log: "[5/12] Response headers filter — /fast ..."
+      - logger.log: "[5/13] Response headers filter — /fast ..."
       - http_request_async.get:
           url: "http://${test_server}/fast"
           capture_response: false
@@ -221,23 +233,23 @@ script:
                   bool ok = (xs == "http_request_async-test") && ct.empty();
                   if (ok) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 5/12 Headers filter: x-server='%s' content-type=''",
+                    ESP_LOGI("hw_test", "[PASS] 5/13 Headers filter: x-server='%s' content-type=''",
                              xs.c_str());
                   } else {
                     id(fail_count)++;
                     ESP_LOGE("hw_test",
-                             "[FAIL] 5/12 Headers filter: x-server='%s' content-type='%s'",
+                             "[FAIL] 5/13 Headers filter: x-server='%s' content-type='%s'",
                              xs.c_str(), ct.c_str());
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 5/12 Headers filter: on_error fired"
+              - logger.log: "[FAIL] 5/13 Headers filter: on_error fired"
 
-      # ── 6/12: Request header injection ────────────────────────────────────────
+      # ── 6/13: Request header injection ────────────────────────────────────────
       # /headers echoes all incoming request headers as JSON in the body.
       # Expect: the custom sentinel value appears in the echoed body.
-      - logger.log: "[6/12] Request header injection — /headers ..."
+      - logger.log: "[6/13] Request header injection — /headers ..."
       - http_request_async.get:
           url: "http://${test_server}/headers"
           capture_response: true
@@ -250,20 +262,20 @@ script:
                   bool ok = (body.find("sentinel-abc123") != std::string::npos);
                   if (ok) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 6/12 Header injection: sentinel found in echo");
+                    ESP_LOGI("hw_test", "[PASS] 6/13 Header injection: sentinel found in echo");
                   } else {
                     id(fail_count)++;
                     ESP_LOGE("hw_test",
-                             "[FAIL] 6/12 Header injection: sentinel not in body: %.200s",
+                             "[FAIL] 6/13 Header injection: sentinel not in body: %.200s",
                              body.c_str());
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 6/12 Header injection: on_error fired"
+              - logger.log: "[FAIL] 6/13 Header injection: on_error fired"
 
-      # ── 7/12: DELETE method ────────────────────────────────────────────────────
-      - logger.log: "[7/12] DELETE method — /delete ..."
+      # ── 7/13: DELETE method ────────────────────────────────────────────────────
+      - logger.log: "[7/13] DELETE method — /delete ..."
       - http_request_async.send:
           method: DELETE
           url: "http://${test_server}/delete"   # DELETE /delete
@@ -273,19 +285,19 @@ script:
               - lambda: |-
                   if (response->status_code == 200) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 7/12 DELETE: status=%d", response->status_code);
+                    ESP_LOGI("hw_test", "[PASS] 7/13 DELETE: status=%d", response->status_code);
                   } else {
                     id(fail_count)++;
-                    ESP_LOGE("hw_test", "[FAIL] 7/12 DELETE: status=%d", response->status_code);
+                    ESP_LOGE("hw_test", "[FAIL] 7/13 DELETE: status=%d", response->status_code);
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 7/12 DELETE: on_error fired"
+              - logger.log: "[FAIL] 7/13 DELETE: on_error fired"
 
-      # ── 8/12: PATCH method ─────────────────────────────────────────────────────
+      # ── 8/13: PATCH method ─────────────────────────────────────────────────────
       # /patch echoes the request body in the JSON response.
-      - logger.log: "[8/12] PATCH method — /patch ..."
+      - logger.log: "[8/13] PATCH method — /patch ..."
       - http_request_async.send:
           method: PATCH
           url: "http://${test_server}/patch"   # PATCH /patch
@@ -299,21 +311,21 @@ script:
                             (body.find("hw_test") != std::string::npos);
                   if (ok) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 8/12 PATCH: status=%d body echoed",
+                    ESP_LOGI("hw_test", "[PASS] 8/13 PATCH: status=%d body echoed",
                              response->status_code);
                   } else {
                     id(fail_count)++;
-                    ESP_LOGE("hw_test", "[FAIL] 8/12 PATCH: status=%d body=%s",
+                    ESP_LOGE("hw_test", "[FAIL] 8/13 PATCH: status=%d body=%s",
                              response->status_code, body.c_str());
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 8/12 PATCH: on_error fired"
+              - logger.log: "[FAIL] 8/13 PATCH: on_error fired"
 
-      # ── 9/12: Redirect following ───────────────────────────────────────────────
+      # ── 9/13: Redirect following ───────────────────────────────────────────────
       # /redirect?n=3 chains three HTTP 302s before landing on /fast (200).
-      - logger.log: "[9/12] Redirect following — /redirect?n=3 ..."
+      - logger.log: "[9/13] Redirect following — /redirect?n=3 ..."
       - http_request_async.get:
           url: "http://${test_server}/redirect?n=3"
           capture_response: false
@@ -322,72 +334,145 @@ script:
               - lambda: |-
                   if (response->status_code == 200) {
                     id(pass_count)++;
-                    ESP_LOGI("hw_test", "[PASS] 9/12 Redirect: followed 3 hops, final status=%d",
+                    ESP_LOGI("hw_test", "[PASS] 9/13 Redirect: followed 3 hops, final status=%d",
                              response->status_code);
                   } else {
                     id(fail_count)++;
-                    ESP_LOGE("hw_test", "[FAIL] 9/12 Redirect: status=%d (expected 200)",
+                    ESP_LOGE("hw_test", "[FAIL] 9/13 Redirect: status=%d (expected 200)",
                              response->status_code);
                   }
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 9/12 Redirect: on_error fired (limit exceeded or network error)"
+              - logger.log: "[FAIL] 9/13 Redirect: on_error fired (limit exceeded or network error)"
 
-      # ── 10/12: Sequential requests — two back-to-back GETs in one script ────────
+      # ── 10/13: Sequential requests — two back-to-back GETs in one script ────────
       # The second request must not start until the first on_complete fires.
       # Both must succeed. This exercises the play_complex() resume chain.
-      - logger.log: "[10/12] Sequential requests — two back-to-back GETs ..."
+      - logger.log: "[10/13] Sequential requests — two back-to-back GETs ..."
       - http_request_async.get:
           url: "http://${test_server}/fast"
           capture_response: false
           on_response:
             then:
-              - logger.log: "[10/12] Sequential: request A done"
+              - logger.log: "[10/13] Sequential: request A done"
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 10/12 Sequential: request A on_error"
+              - logger.log: "[FAIL] 10/13 Sequential: request A on_error"
       - http_request_async.get:
           url: "http://${test_server}/fast"
           capture_response: false
           on_response:
             then:
               - lambda: id(pass_count)++;
-              - logger.log: "[PASS] 10/12 Sequential: both requests completed"
+              - logger.log: "[PASS] 10/13 Sequential: both requests completed"
           on_error:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 10/12 Sequential: request B on_error"
+              - logger.log: "[FAIL] 10/13 Sequential: request B on_error"
 
-      # ── 11/12: HTTP 404 routes to on_error, not on_response ───────────────────
+      # ── 11/13: HTTP 404 routes to on_error, not on_response ───────────────────
       # The component treats 4xx and 5xx as errors. on_response must NOT fire.
-      - logger.log: "[11/12] 4xx→on_error — /status/404 ..."
+      - logger.log: "[11/13] 4xx→on_error — /status/404 ..."
       - http_request_async.get:
           url: "http://${test_server}/status?code=404"
           capture_response: false
           on_response:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 11/12 4xx→on_error: on_response fired (expected on_error)"
+              - logger.log: "[FAIL] 11/13 4xx→on_error: on_response fired (expected on_error)"
           on_error:
             then:
               - lambda: id(pass_count)++;
-              - logger.log: "[PASS] 11/12 4xx→on_error: on_error fired correctly"
+              - logger.log: "[PASS] 11/13 4xx→on_error: on_error fired correctly"
 
-      # ── 12/12: HTTP 500 routes to on_error, not on_response ───────────────────
-      - logger.log: "[12/12] 5xx→on_error — /status/500 ..."
+      # ── 12/13: HTTP 500 routes to on_error, not on_response ───────────────────
+      - logger.log: "[12/13] 5xx→on_error — /status/500 ..."
       - http_request_async.get:
           url: "http://${test_server}/status?code=500"
           capture_response: false
           on_response:
             then:
               - lambda: id(fail_count)++;
-              - logger.log: "[FAIL] 12/12 5xx→on_error: on_response fired (expected on_error)"
+              - logger.log: "[FAIL] 12/13 5xx→on_error: on_response fired (expected on_error)"
           on_error:
             then:
               - lambda: id(pass_count)++;
-              - logger.log: "[PASS] 12/12 5xx→on_error: on_error fired correctly"
+              - logger.log: "[PASS] 12/13 5xx→on_error: on_error fired correctly"
+
+      # ── 13/13: Nested request inside on_response (reference in Ts...) ──────────
+      # A nested action carries the outer body through the async round-trip as a
+      # std::string & inside the callback closures. The checks below fail loudly
+      # if what comes back is a dangling reference rather than an owned copy.
+      #
+      # /echo sleeps 1 s, so the elapsed check also proves the inner chain waited.
+      #
+      # The wait_until is required: a trigger's `then:` block is an independent
+      # automation, so this script resumes without waiting for it. Tests 1–12
+      # increment synchronously inside on_response, this one does not.
+      - logger.log: "[13/13] Nested request inside on_response — chained args ..."
+      - lambda: |-
+          id(nested_seen_len) = 0;
+          id(nested_done) = false;
+      - http_request_async.get:
+          url: "http://${test_server}/headers"
+          capture_response: true
+          max_response_buffer_size: 2048
+          request_headers:
+            X-Nested-Outer: "outer-sentinel-xyz789"
+          on_response:
+            then:
+              - lambda: id(nested_t0) = millis();
+              # JSON body built from the OUTER response body
+              - http_request_async.post:
+                  url: "http://${test_server}/echo"
+                  capture_response: false
+                  request_headers:
+                    Content-Type: application/json
+                  json: |-
+                    id(nested_seen_len) = body.size();
+                    root["nested"] = "true";
+                    root["outer_len"] = to_string(body.size());
+                    root["outer_has_sentinel"] =
+                        body.find("outer-sentinel-xyz789") != std::string::npos ? "yes" : "no";
+              # Reached after the nested POST completed; `body` is still the outer body
+              - lambda: |-
+                  const uint32_t elapsed = millis() - id(nested_t0);
+                  const bool waited   = elapsed >= 900;                  // /echo sleeps 1 s
+                  const bool intact   = body.find("outer-sentinel-xyz789") != std::string::npos;
+                  const bool same_len = id(nested_seen_len) == body.size();
+                  if (waited && intact && same_len) {
+                    id(pass_count)++;
+                    ESP_LOGI("hw_test",
+                             "[PASS] 13/13 Nested: chain waited %ums, outer body intact (%u B)",
+                             elapsed, (unsigned) body.size());
+                  } else {
+                    id(fail_count)++;
+                    ESP_LOGE("hw_test",
+                             "[FAIL] 13/13 Nested: waited=%d (%ums) intact=%d same_len=%d "
+                             "(build saw %u B, now %u B)",
+                             waited, elapsed, intact, same_len,
+                             (unsigned) id(nested_seen_len), (unsigned) body.size());
+                  }
+                  id(nested_done) = true;
+          on_error:
+            then:
+              - lambda: |-
+                  id(fail_count)++;
+                  id(nested_done) = true;
+              - logger.log: "[FAIL] 13/13 Nested: outer request on_error fired"
+
+      # Hold here so the summary below counts test 13
+      - wait_until:
+          condition:
+            lambda: 'return id(nested_done);'
+          timeout: 25s
+      - lambda: |-
+          if (!id(nested_done)) {
+            id(fail_count)++;
+            ESP_LOGE("hw_test", "[FAIL] 13/13 Nested: timed out — chain never resumed");
+          }
 
       # ── Final summary ──────────────────────────────────────────────────────────
       - lambda: |-

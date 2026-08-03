@@ -403,6 +403,75 @@ The pending-request queue holds 8 entries. A 9th enqueue fires `on_error`
 immediately and drops the request. See [Concurrency](#concurrency) for
 sizing and mitigation strategies.
 
+### Nested requests cannot declare their own `on_response`/`on_error`
+
+Chaining a second request from inside the `on_response` of a
+`capture_response: true` request works, and the outer `response` and `body` stay
+usable in the nested action:
+
+```yaml
+- http_request_async.get:
+    url: "http://device/status"
+    capture_response: true
+    on_response:
+      then:
+        - http_request_async.post:
+            url: "http://logger/report"
+            json:
+              upstream: !lambda 'return body;'   # outer body — fine
+```
+
+What does **not** compile is giving that nested action an `on_response` or
+`on_error` of its own. ESPHome names trigger lambda parameters positionally and
+appends the enclosing trigger's variables, so the inner lambda would be generated
+with two parameters called `response`:
+
+```
+error: redefinition of 'std::shared_ptr<HttpContainer> response'
+```
+
+This is an ESPHome codegen limitation, not specific to this component — the
+built-in `http_request` behaves identically. Work around it by moving the nested
+request into its own `script` and calling `script.execute`, which gives the inner
+triggers a clean parameter scope. Note that `script.execute` does not wait for the
+script to finish; use `script.wait` afterwards if the chain must stay sequential.
+
+### A nested request does not delay the enclosing chain
+
+The sequential-by-default guarantee (see [Concurrency](#concurrency)) applies to actions in
+the *same* chain. A trigger's `then:` block is a separate automation: `loop()`
+fires `on_response` and then immediately resumes whatever followed the request.
+It does not wait for the trigger's own actions to finish.
+
+So in this script, `logger.log` runs **before** the nested POST completes:
+
+```yaml
+- http_request_async.get:
+    url: "http://device/status"
+    capture_response: true
+    on_response:
+      then:
+        - http_request_async.post:      # still in flight …
+            url: "http://logger/report"
+- logger.log: "done"                    # … when this already ran
+```
+
+Actions *inside* the `then:` block remain correctly ordered relative to each
+other — anything after the nested POST there does wait for it. Only the outer
+chain runs ahead. If the outer chain must wait too, set a global at the end of
+the inner block and gate on it:
+
+```yaml
+- wait_until:
+    condition:
+      lambda: 'return id(nested_done);'
+    timeout: 25s
+```
+
+This is inherent to how ESPHome triggers work and applies to the built-in
+`http_request` as well; it is only more visible here because the nested request
+takes real time without blocking the loop.
+
 ### `verify_ssl: false` depends on sdkconfig
 
 `verify_ssl: false` works by emitting two sdkconfig flags at compile time:

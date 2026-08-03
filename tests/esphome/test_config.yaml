@@ -162,6 +162,45 @@ script:
             then:
               - logger.log: "Ping failed"
 
+  # ── Test: action nested inside on_response (reference type in Ts...) ────────
+  #
+  # A nested action is generated with Ts... = (shared_ptr<HttpContainer>,
+  # std::string &) — the outer body by non-const reference. Covers all three body
+  # forms plus a chained action, since each reaches a different capture site.
+  #
+  # The nested actions declare no on_response/on_error of their own: ESPHome
+  # appends the enclosing trigger's variables to the inner lambda, which would
+  # yield two parameters named `response`. See "Known limitations" in the README.
+  - id: test_nested_action_in_on_response
+    mode: queued
+    then:
+      - http_request_async.get:
+          url: "http://192.168.1.100/outer"
+          capture_response: true
+          on_response:
+            then:
+              # json: dict form — TemplatableValue::value(Ts...) sees std::string &
+              - http_request_async.post:
+                  url: "http://192.168.1.100/inner-dict"
+                  json:
+                    status: "ok"
+                    echoed: !lambda 'return body;'
+              # json: lambda form — json_func_(Ts..., root) sees std::string &
+              - http_request_async.post:
+                  url: "http://192.168.1.100/inner-lambda"
+                  json: |-
+                    root["status"] = "ok";
+                    root["len"] = to_string(body.size());
+              # Verbatim templated body — body_.value(Ts...) sees std::string &
+              - http_request_async.send:
+                  method: PUT
+                  url: "http://192.168.1.100/inner-send"
+                  body: !lambda 'return body;'
+              # Chained after the nested requests — on_complete_cb → play_next_()
+              - logger.log:
+                  format: "chain resumed after nested requests, outer body len=%u"
+                  args: ["(unsigned) body.size()"]
+
   # ── Test: night mode bool parameter (matches shelly_api_Light_SetNightMode) ──
   - id: test_post_bool_param
     mode: queued

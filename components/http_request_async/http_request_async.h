@@ -251,13 +251,16 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
     }
 
     // Body: verbatim string takes priority; then JSON lambda; then JSON dict
+    //
+    // `mutable`: Ts... holds a non-const reference when this action is nested in
+    // an on_response (the outer body). A const captured copy cannot bind to it.
     if (this->body_.has_value()) {
       req->body = this->body_.value(x...);
     } else if (this->json_func_ != nullptr) {
       req->body = json::build_json(
-          [this, x...](JsonObject root) { this->json_func_(x..., root); });
+          [this, x...](JsonObject root) mutable { this->json_func_(x..., root); });
     } else if (!this->json_pairs_.empty()) {
-      req->body = json::build_json([this, x...](JsonObject root) {
+      req->body = json::build_json([this, x...](JsonObject root) mutable {
         for (const auto &pair : this->json_pairs_) {
           root[pair.first] = pair.second.value(x...);
         }
@@ -274,10 +277,13 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
     this->alive_ = alive;
 
     const bool capture = this->capture_response_;
+    // make_tuple decays, so a reference in Ts... is stored as an owned copy —
+    // the callbacks run from loop(), long after the caller's frame is gone.
+    // They are `mutable` so those copies stay bindable to a reference in Ts...
     auto args_tuple = std::make_tuple(x...);
 
     req->on_response_cb = [this, alive, args_tuple,
-                           capture](std::shared_ptr<HttpContainer> container) {
+                           capture](std::shared_ptr<HttpContainer> container) mutable {
       if (!*alive)
         return;
       if (capture) {
@@ -298,18 +304,20 @@ class HttpRequestAsyncSendAction : public Action<Ts...> {
       }
     };
 
-    req->on_error_cb = [this, alive, args_tuple]() {
+    req->on_error_cb = [this, alive, args_tuple]() mutable {
       if (!*alive)
         return;
       std::apply([this](Ts... a) { this->error_trigger_.trigger(a...); },
                  args_tuple);
     };
 
-    req->on_complete_cb = [this, alive, args_tuple]() {
+    req->on_complete_cb = [this, alive, args_tuple]() mutable {
       if (!*alive)
         return;
       this->is_waiting_ = false;
-      this->play_next_tuple_(args_tuple);
+      // Not play_next_tuple_(): it takes const std::tuple<Ts...> &, which is a
+      // tuple OF references when Ts... has one — the decayed tuple won't convert.
+      std::apply([this](Ts... a) { this->play_next_(a...); }, args_tuple);
     };
 
     this->parent_->enqueue_request(req);

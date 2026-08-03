@@ -69,8 +69,14 @@ class MockHttpRequestAsyncComponent : public HttpRequestAsyncComponent {
     pump_responses();
   }
 
+  /// Body of the last request seen by execute_request_() — lets action-level
+  /// tests assert on what play_complex() built, not just on the response side.
+  std::string last_request_body;
+
  protected:
   void execute_request_(PendingRequest *req) override {
+    this->last_request_body = req->body;
+
     auto container = std::make_shared<HttpContainer>();
     container->status_code = this->next_response_.status_code;
     // Derive success from HTTP status code — matches real IDF behaviour:
@@ -1096,6 +1102,155 @@ TEST(HttpRequestAsync, IdfWriteNegativeReturnTriggersOnError) {
   EXPECT_TRUE(error_called);
   EXPECT_FALSE(response_called);
   EXPECT_EQ(g_idf_mock.write_call_count, 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Nested action: reference types in Ts...
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// An action nested inside the on_response of a capture_response request is
+// generated with Ts... = (std::shared_ptr<HttpContainer>, std::string &): the
+// outer body arrives as a non-const reference. These are primarily COMPILE-TIME
+// guards — a non-mutable lambda in play_complex() makes the captured copies
+// const and the translation unit does not build.
+//
+// The runtime assertions pin the ownership rule: args_tuple holds decayed
+// copies, so what reaches the triggers and the automation chain is the closure's
+// own copy, never the outer callback's stack frame.
+
+using NestedAction = HttpRequestAsyncSendAction<std::shared_ptr<HttpContainer>, std::string &>;
+using NestedStr = TemplatableValue<std::string, std::shared_ptr<HttpContainer>, std::string &>;
+using NestedMethod = TemplatableValue<const char *, std::shared_ptr<HttpContainer>, std::string &>;
+
+// Stands in for a further action chained after the nested HTTP action, with the
+// same reference-carrying Ts...
+class MockChainedRefAction : public esphome::Action<std::shared_ptr<HttpContainer>, std::string &> {
+ public:
+  void play(const std::shared_ptr<HttpContainer> &container, std::string &body) override {
+    this->played = true;
+    this->seen_body = body;
+    body += "-touched";  // the target is the closure's copy, so this is safe
+  }
+
+  bool played{false};
+  std::string seen_body;
+};
+
+// ── json: dict form nested in on_response ─────────────────────────────────────
+
+TEST(HttpRequestAsync, NestedActionJsonDictWithReferenceInTs) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "inner-response"});
+
+  NestedAction action(&comp);
+  action.set_url(NestedStr("http://example.com/inner"));
+  action.set_method(NestedMethod("POST"));
+  action.set_capture_response(true);
+  action.set_max_response_buffer_size(4096);
+
+  // value() is invoked with Ts..., so with the outer body as std::string &.
+  action.init_json(1);
+  action.add_json(
+      "echo", NestedStr(std::function<std::string(std::shared_ptr<HttpContainer>, std::string &)>(
+                  [](std::shared_ptr<HttpContainer>, std::string &outer) { return outer; })));
+
+  std::string trigger_saw_outer;
+  std::string trigger_saw_inner;
+  action.get_response_trigger()->add_callback(
+      [&](std::shared_ptr<HttpContainer> inner_container, std::string &inner_body,
+          std::shared_ptr<HttpContainer> outer_container, std::string &outer_body) {
+        trigger_saw_inner = inner_body;
+        trigger_saw_outer = outer_body;
+      });
+
+  MockChainedRefAction chained;
+  action.set_next(&chained);
+
+  // The outer on_response arguments. `outer_body` is a local on purpose — in the
+  // component it is a local of on_response_cb, dead before the inner response.
+  auto outer_container = std::make_shared<HttpContainer>();
+  std::string outer_body = "outer-value";
+
+  action.play_complex(outer_container, outer_body);
+
+  comp.pump_worker();
+  EXPECT_EQ(comp.last_request_body, R"({"echo":"outer-value"})");
+
+  // The callbacks hold a copy, so this must not reach them.
+  outer_body = "mutated-after-enqueue";
+
+  comp.pump_responses();
+
+  EXPECT_EQ(trigger_saw_inner, "inner-response");
+  EXPECT_EQ(trigger_saw_outer, "outer-value");
+
+  EXPECT_TRUE(chained.played);
+  EXPECT_EQ(chained.seen_body, "outer-value");
+
+  EXPECT_EQ(outer_body, "mutated-after-enqueue");  // never written through
+  EXPECT_FALSE(action.is_running());
+}
+
+// ── json: lambda form nested in on_response ───────────────────────────────────
+
+TEST(HttpRequestAsync, NestedActionJsonLambdaWithReferenceInTs) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({200, "inner-response"});
+
+  NestedAction action(&comp);
+  action.set_url(NestedStr("http://example.com/inner"));
+  action.set_method(NestedMethod("POST"));
+  action.set_capture_response(false);
+
+  // json_func_ receives Ts... followed by the JsonObject root.
+  std::string json_func_saw;
+  action.set_json([&json_func_saw](std::shared_ptr<HttpContainer> outer_container,
+                                   std::string &outer_body, JsonObject root) {
+    json_func_saw = outer_body;
+    root["echo"] = outer_body;
+  });
+
+  bool response_fired = false;
+  action.get_response_trigger_no_body()->add_callback(
+      [&](std::shared_ptr<HttpContainer>, std::shared_ptr<HttpContainer>, std::string &) {
+        response_fired = true;
+      });
+
+  auto outer_container = std::make_shared<HttpContainer>();
+  std::string outer_body = "outer-value";
+
+  action.play_complex(outer_container, outer_body);
+  comp.tick();
+
+  EXPECT_EQ(json_func_saw, "outer-value");
+  EXPECT_EQ(comp.last_request_body, R"({"echo":"outer-value"})");
+  EXPECT_TRUE(response_fired);
+}
+
+// ── on_error path with a reference in Ts... ───────────────────────────────────
+//
+// on_error_cb captures args_tuple too. A 5xx response is enough to reach it.
+
+TEST(HttpRequestAsync, NestedActionOnErrorWithReferenceInTs) {
+  MockHttpRequestAsyncComponent comp;
+  comp.set_next_response({500, ""});
+
+  NestedAction action(&comp);
+  action.set_url(NestedStr("http://example.com/inner"));
+  action.set_method(NestedMethod("GET"));
+
+  std::string error_saw_outer;
+  action.get_error_trigger()->add_callback(
+      [&](std::shared_ptr<HttpContainer>, std::string &outer_body) { error_saw_outer = outer_body; });
+
+  auto outer_container = std::make_shared<HttpContainer>();
+  std::string outer_body = "outer-value";
+
+  action.play_complex(outer_container, outer_body);
+  comp.tick();
+
+  EXPECT_EQ(error_saw_outer, "outer-value");
+  EXPECT_FALSE(action.is_running());  // on_complete_cb still ran after on_error
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
