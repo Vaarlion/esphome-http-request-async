@@ -30,7 +30,7 @@ struct IdfHttpMockState {
   std::string      response_body; ///< Body returned by read() on the final hop.
 
   /// Headers fired by the event handler on every fetch_headers() call.
-  /// key: lower-case header name (matches what collect_headers expects).
+  /// key: header name in the casing the server would send (any case is matched).
   std::map<std::string, std::string> response_headers;
 
   // ── Redirect control ──────────────────────────────────────────────────────
