@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <strings.h>  // strcasecmp
+
 #include "esphome/components/json/json_util.h"
 #include "esphome/core/application.h"
 #include "esphome/core/automation.h"
@@ -48,10 +50,14 @@ class HttpContainer {
 
   /// Case-insensitive response header lookup.
   /// Returns empty string if the header was not collected.
+  /// Linear scan rather than find(): the map only ever holds the handful of
+  /// headers the action asked for, and this avoids folding the key on the heap.
   std::string get_response_header(const std::string &name) const {
-    const std::string lower = str_lower_case(name);
-    auto it = this->response_headers_.find(lower);
-    return (it != this->response_headers_.end()) ? it->second : std::string{};
+    for (const auto &kv : this->response_headers_) {
+      if (strcasecmp(kv.first.c_str(), name.c_str()) == 0)
+        return kv.second;
+    }
+    return {};
   }
 
   // Internal — populated by the worker task via the event handler.

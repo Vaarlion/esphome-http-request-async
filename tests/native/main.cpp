@@ -984,6 +984,44 @@ TEST(HttpRequestAsync, IdfRedirectClearsIntermediateHeaders) {
   EXPECT_EQ(captured_header, "prod");
 }
 
+// ── Header collection folds the wire casing ───────────────────────────────────
+//
+// Servers send whatever casing they like ("Content-Type", "SERVER"), while
+// collect_headers is lower-cased at codegen time. The event handler compares
+// case-insensitively instead of folding every incoming key onto the heap, so
+// this pins the behaviour that comparison — not allocation — provides.
+
+TEST(HttpRequestAsync, IdfCollectedHeadersMatchServerCasing) {
+  g_idf_mock.reset();
+  g_idf_mock.response_headers = {
+      {"Content-Type", "application/json"},
+      {"X-Request-ID", "abc-123"},
+      {"SERVER", "nginx"},
+  };
+
+  IdfMockHttpRequestAsyncComponent comp;
+
+  std::string ct, rid, uncollected, absent;
+  auto *req = make_request();
+  req->lower_case_collect_headers = {"content-type", "x-request-id"};
+  req->on_response_cb = [&](std::shared_ptr<HttpContainer> c) {
+    ct          = c->get_response_header("Content-Type");
+    rid         = c->get_response_header("x-request-id");
+    uncollected = c->get_response_header("server");
+    absent      = c->get_response_header("x-nope");
+  };
+
+  comp.enqueue_request(req);
+  comp.tick();
+
+  // Matched despite the server's casing, and retrievable by any casing.
+  EXPECT_EQ(ct, "application/json");
+  EXPECT_EQ(rid, "abc-123");
+  // Sent by the server but not requested — must not be stored.
+  EXPECT_EQ(uncollected, "");
+  EXPECT_EQ(absent, "");
+}
+
 // ── Response queue overflow does not permanently stall the automation ─────────
 //
 // Regression test for: if the main loop is blocked long enough for QUEUE_DEPTH

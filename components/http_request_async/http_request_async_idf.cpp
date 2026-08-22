@@ -2,6 +2,8 @@
 
 #ifdef USE_ESP32
 
+#include <strings.h>  // strcasecmp
+
 #include "esp_http_client.h"
 #include "esp_timer.h"
 
@@ -33,11 +35,13 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
 
   switch (evt->event_id) {
     case HTTP_EVENT_ON_HEADER: {
-      // Collect only the response headers the action asked for.
-      const std::string lower_key = str_lower_case(evt->header_key);
+      // Collect only the response headers the action asked for. Compared with
+      // strcasecmp against the already-lowercased collect list, so a request
+      // that collects nothing costs no allocation at all — this fires for every
+      // header of every response.
       for (const auto &name : ctx->req->lower_case_collect_headers) {
-        if (name == lower_key) {
-          ctx->container->response_headers_[lower_key] = evt->header_value;
+        if (strcasecmp(name.c_str(), evt->header_key) == 0) {
+          ctx->container->response_headers_[name] = evt->header_value;
           break;
         }
       }
